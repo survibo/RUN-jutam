@@ -1,326 +1,199 @@
 """
-PyTorch version of microgpt_for_mod.py.
-Keeps the same modulo-addition task, model shape, training loop, and evaluation
-flow, but delegates tensors and autograd to PyTorch.
+The most atomic way to train and run inference for a GPT in pure, dependency-free Python.
+This file is the complete algorithm.
+Everything else is just efficiency.
+@karpathy
 """
 
 import os       # os.path.exists
-import random   # random.seed, random.shuffle
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-except ModuleNotFoundError:
-    raise ModuleNotFoundError("PyTorch is required to run this file. Install torch first.") from None
-
+import math     # math.log, math.exp
+import random   # random.seed, random.choices, random.gauss, random.shuffle
 random.seed(42) # Let there be order among chaos
-torch.manual_seed(42)
 
-# Modulo addition task setting
-MODULUS = 87
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-INPUT_PATH = os.path.join(PROJECT_ROOT, 'example1.txt')
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'outputs')
-NUMBER_VECTOR_PATH = os.path.join(OUTPUT_DIR, 'number_vectors.txt')
-EFFECTIVE_NUMBER_VECTOR_PATH = os.path.join(OUTPUT_DIR, 'number_vectors_effective.txt')
-SNAPSHOT_DIR = os.path.join(OUTPUT_DIR, 'embedding_snapshots')
-if MODULUS < 2:
-    raise ValueError("MODULUS must be at least 2")
-
-# Let there be a Dataset `docs`: list[str] of modulo addition examples, e.g. "4 + 14 = 18"
-if not os.path.exists(INPUT_PATH):
-    raise FileNotFoundError(f"expected {INPUT_PATH} with lines like '4 + 14 = 18'")
-docs = [line.strip() for line in open(INPUT_PATH) if line.strip()]
+# Let there be a Dataset `docs`: list[str] of documents (e.g. a list of names)
+if not os.path.exists('input.txt'):
+    import urllib.request
+    names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
+    urllib.request.urlretrieve(names_url, 'input.txt')
+docs = [line.strip() for line in open('input.txt') if line.strip()]
 random.shuffle(docs)
 print(f"num docs: {len(docs)}")
 
-def parse_example(doc):
-    parts = doc.split()
-    if len(parts) != 5 or parts[1] != '+' or parts[3] != '=':
-        raise ValueError(f"bad example format: {doc!r}")
-    a, b, target = int(parts[0]), int(parts[2]), int(parts[4])
-    if not (0 <= a < MODULUS and 0 <= b < MODULUS and 0 <= target < MODULUS):
-        raise ValueError(f"example out of range for MODULUS={MODULUS}: {doc!r}")
-    expected = (a + b) % MODULUS
-    if target != expected:
-        raise ValueError(f"wrong target for MODULUS={MODULUS}: {doc!r}, expected {expected}")
-    return a, b, target
-
-examples = [parse_example(doc) for doc in docs]
-
 # Let there be a Tokenizer to translate strings to sequences of integers ("tokens") and back
-utokens = [str(i) for i in range(MODULUS)] # number tokens become token ids 0..n-1
-stoi = {token: i for i, token in enumerate(utokens)}
-itos = {i: token for token, i in stoi.items()}
-vocab_size = len(utokens) # total number of unique tokens
+uchars = sorted(set(''.join(docs))) # unique characters in the dataset become token ids 0..n-1
+BOS = len(uchars) # token id for a special Beginning of Sequence (BOS) token
+vocab_size = len(uchars) + 1 # total number of unique tokens, +1 is for BOS
 print(f"vocab size: {vocab_size}")
-print(utokens)
 
-def encode_prompt(a, b):
-    return [stoi[str(a)], stoi[str(b)]]
+# Let there be Autograd to recursively apply the chain rule through a computation graph
+class Value:
+    __slots__ = ('data', 'grad', '_children', '_local_grads') # Python optimization for memory usage
 
-# Initialize the model hyperparameters
+    def __init__(self, data, children=(), local_grads=()):
+        self.data = data                # scalar value of this node calculated during forward pass
+        self.grad = 0                   # derivative of the loss w.r.t. this node, calculated in backward pass
+        self._children = children       # children of this node in the computation graph
+        self._local_grads = local_grads # local derivative of this node w.r.t. its children
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data + other.data, (self, other), (1, 1))
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data * other.data, (self, other), (other.data, self.data))
+
+    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
+    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
+    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
+    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
+    def __neg__(self): return self * -1
+    def __radd__(self, other): return self + other
+    def __sub__(self, other): return self + (-other)
+    def __rsub__(self, other): return other + (-self)
+    def __rmul__(self, other): return self * other
+    def __truediv__(self, other): return self * other**-1
+    def __rtruediv__(self, other): return other * self**-1
+
+    def backward(self):
+        topo = []
+        visited = set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for child in v._children:
+                    build_topo(child)
+                topo.append(v)
+        build_topo(self)
+        self.grad = 1
+        for v in reversed(topo):
+            for child, local_grad in zip(v._children, v._local_grads):
+                child.grad += local_grad * v.grad
+
+# Initialize the parameters, to store the knowledge of the model
 n_layer = 1     # depth of the transformer neural network (number of layers)
-n_embd = 64     # width of the network (embedding dimension)
-block_size = 2  # maximum context length of the attention window: a b
-n_head = 1      # number of attention heads
+n_embd = 16     # width of the network (embedding dimension)
+block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
+n_head = 4      # number of attention heads
 head_dim = n_embd // n_head # derived dimension of each head
+matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
+state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+for i in range(n_layer):
+    state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
+    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
+print(f"num params: {len(params)}")
 
-class RMSNorm(nn.Module):
-    def forward(self, x):
-        ms = (x * x).mean(dim=-1, keepdim=True)
-        return x * torch.rsqrt(ms + 1e-5)
+# Define the model architecture: a function mapping tokens and parameters to logits over what comes next
+# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
+def linear(x, w):
+    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
-class Block(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.attn_wq = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_wk = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_wv = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_wo = nn.Linear(n_embd, n_embd, bias=False)
-        self.mlp_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
-        self.mlp_fc2 = nn.Linear(4 * n_embd, n_embd, bias=False)
-        self.rmsnorm = RMSNorm()
+def softmax(logits):
+    max_val = max(val.data for val in logits)
+    exps = [(val - max_val).exp() for val in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
 
-    def forward(self, x):
-        bsz, seq_len, _ = x.shape
+def rmsnorm(x):
+    ms = sum(xi * xi for xi in x) / len(x)
+    scale = (ms + 1e-5) ** -0.5
+    return [xi * scale for xi in x]
 
+def gpt(token_id, pos_id, keys, values):
+    tok_emb = state_dict['wte'][token_id] # token embedding
+    pos_emb = state_dict['wpe'][pos_id] # position embedding
+    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
+    x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
+
+    for li in range(n_layer):
         # 1) Multi-head Attention block
         x_residual = x
-        x = self.rmsnorm(x)
-        q = self.attn_wq(x)
-        k = self.attn_wk(x)
-        v = self.attn_wv(x)
-
-        q = q.view(bsz, seq_len, n_head, head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, n_head, head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, n_head, head_dim).transpose(1, 2)
-
-        attn_logits = q @ k.transpose(-2, -1) / (head_dim ** 0.5)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
-        attn_logits = attn_logits.masked_fill(causal_mask, float('-inf'))
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        x_attn = attn_weights @ v
-        x_attn = x_attn.transpose(1, 2).contiguous().view(bsz, seq_len, n_embd)
-        x = self.attn_wo(x_attn)
-        x = x + x_residual
-
+        x = rmsnorm(x)
+        q = linear(x, state_dict[f'layer{li}.attn_wq'])
+        k = linear(x, state_dict[f'layer{li}.attn_wk'])
+        v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        keys[li].append(k)
+        values[li].append(v)
+        x_attn = []
+        for h in range(n_head):
+            hs = h * head_dim
+            q_h = q[hs:hs+head_dim]
+            k_h = [ki[hs:hs+head_dim] for ki in keys[li]]
+            v_h = [vi[hs:hs+head_dim] for vi in values[li]]
+            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
+            attn_weights = softmax(attn_logits)
+            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
+            x_attn.extend(head_out)
+        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
+        x = [a + b for a, b in zip(x, x_residual)]
         # 2) MLP block
         x_residual = x
-        x = self.rmsnorm(x)
-        x = self.mlp_fc1(x)
-        x = F.relu(x)
-        x = self.mlp_fc2(x)
-        x = x + x_residual
-        return x
+        x = rmsnorm(x)
+        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
+        x = [xi.relu() for xi in x]
+        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
+        x = [a + b for a, b in zip(x, x_residual)]
 
-class TinyGPT(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.wte = nn.Embedding(vocab_size, n_embd)
-        self.wpe = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.ModuleList([Block() for _ in range(n_layer)])
-        self.rmsnorm = RMSNorm()
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.apply(self._init_weights)
+    logits = linear(x, state_dict['lm_head'])
+    return logits
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Embedding, nn.Linear)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.08)
-
-    def forward(self, token_ids):
-        bsz, seq_len = token_ids.shape
-        if seq_len > block_size:
-            raise ValueError(f"sequence length {seq_len} exceeds block_size {block_size}")
-        pos_ids = torch.arange(seq_len, device=token_ids.device).unsqueeze(0).expand(bsz, seq_len)
-        x = self.wte(token_ids) + self.wpe(pos_ids)
-        x = self.rmsnorm(x)
-        for block in self.blocks:
-            x = block(x)
-        logits = self.lm_head(x)
-        return logits
-
-device = torch.device(
-    'cuda' if torch.cuda.is_available()
-    else 'mps' if torch.backends.mps.is_available()
-    else 'cpu'
-)
-model = TinyGPT().to(device)
-params = list(model.parameters())
-print(f"num params: {sum(p.numel() for p in params)}")
-print(f"device: {device}")
-
-@torch.no_grad()
-def predict(a, b):
-    was_training = model.training
-    model.eval()
-    prompt_tokens = torch.tensor([encode_prompt(a, b)], dtype=torch.long, device=device)
-    logits = model(prompt_tokens)
-    pred_id = int(torch.argmax(logits[0, -1, :]).item())
-    if was_training:
-        model.train()
-    return int(itos[pred_id])
-
-def evaluate_accuracy():
-    correct = 0
-    total = 0
-    for a in range(MODULUS):
-        for b in range(MODULUS):
-            pred = predict(a, b)
-            target = (a + b) % MODULUS
-            correct += pred == target
-            total += 1
-    return correct, total, correct / total
-
-# Split evaluation: train pairs (seen during training) vs held-out pairs (never seen).
-# Grokking is only measurable on the held-out split — mixing them hides the delayed jump.
-train_eval_pairs = sorted({(a, b) for a, b, _ in examples})
-val_eval_pairs = [(a, b) for a in range(MODULUS) for b in range(MODULUS)
-                  if (a, b) not in set(train_eval_pairs)]
-if not val_eval_pairs:
-    raise ValueError("training file covers the full input space; no held-out pairs to measure generalization")
-print(f"train pairs: {len(train_eval_pairs)} | held-out pairs: {len(val_eval_pairs)}")
-
-def pairs_to_tensors(pairs):
-    inputs = torch.tensor([encode_prompt(a, b) for a, b in pairs], dtype=torch.long, device=device)
-    targets = torch.tensor([stoi[str((a + b) % MODULUS)] for a, b in pairs], dtype=torch.long, device=device)
-    return inputs, targets
-
-train_eval_inputs, train_eval_targets = pairs_to_tensors(train_eval_pairs)
-val_eval_inputs, val_eval_targets = pairs_to_tensors(val_eval_pairs)
-
-@torch.no_grad()
-def evaluate_split(inputs, targets):
-    was_training = model.training
-    model.eval()
-    logits = model(inputs)[:, -1, :]
-    loss = F.cross_entropy(logits, targets).item()
-    preds = torch.argmax(logits, dim=-1)
-    correct = int((preds == targets).sum().item())
-    total = int(targets.numel())
-    if was_training:
-        model.train()
-    return loss, correct, total, correct / total
-
-def write_vectors(path, rows):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        for label, values in rows:
-            values = ' '.join(f"{value:.8f}" for value in values)
-            f.write(f"{label}\t{values}\n")
-
-@torch.no_grad()
-def save_number_vectors(raw_path, effective_path):
-    raw_vectors = model.wte.weight.detach().cpu()
-    raw_rows = []
-    for number in range(MODULUS):
-        token_id = stoi[str(number)]
-        raw_rows.append((number, raw_vectors[token_id].tolist()))
-    write_vectors(raw_path, raw_rows)
-
-    token_ids = torch.arange(MODULUS, dtype=torch.long, device=device)
-    pos0_ids = torch.zeros(MODULUS, dtype=torch.long, device=device)
-    pos1_ids = torch.ones(MODULUS, dtype=torch.long, device=device)
-    raw = model.wte(token_ids)
-    pos0_vectors = model.rmsnorm(raw + model.wpe(pos0_ids)).detach().cpu()
-    pos1_vectors = model.rmsnorm(raw + model.wpe(pos1_ids)).detach().cpu()
-    effective_rows = []
-    for number in range(MODULUS):
-        effective_rows.append((f"{number}\tpos0", pos0_vectors[number].tolist()))
-        effective_rows.append((f"{number}\tpos1", pos1_vectors[number].tolist()))
-    write_vectors(effective_path, effective_rows)
-
-@torch.no_grad()
-def save_embedding_snapshot(step):
-    # One file per training stage: raw wte rows, used for the disorder -> circle animation
-    raw_vectors = model.wte.weight.detach().cpu()
-    rows = [(number, raw_vectors[stoi[str(number)]].tolist()) for number in range(MODULUS)]
-    write_vectors(os.path.join(SNAPSHOT_DIR, f"step_{step:06d}.txt"), rows)
-
-# Let there be AdamW: strong weight decay is the key driver of grokking
-# (Power et al. 2022 / Nanda et al. 2023 use AdamW with weight decay λ=1)
-learning_rate, beta1, beta2, eps_adam = 0.001, 0.85, 0.99, 1e-8
-weight_decay = 1.0
-optimizer = torch.optim.AdamW(params, lr=learning_rate, betas=(beta1, beta2), eps=eps_adam,
-                              weight_decay=weight_decay)
+# Let there be Adam, the blessed optimizer and its buffers
+learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
+m = [0.0] * len(params) # first moment buffer
+v = [0.0] * len(params) # second moment buffer
 
 # Repeat in sequence
-num_steps = 20000 # number of training steps
-log_every = 50
-batch_size = len(examples)
-example_order = list(range(len(examples)))
-batch_cursor = 0
-
-# Metrics CSV: every run self-records its curves (used for the slide animation)
-METRICS_LOG_PATH = os.path.join(OUTPUT_DIR, 'train_log.csv')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-metrics_log = open(METRICS_LOG_PATH, 'w')
-metrics_log.write('step,train_loss,train_acc,val_loss,val_acc\n')
-
-# Embedding snapshots at a fixed cadence (+ init and final) so the
-# memorization -> grokking transition is captured wherever it happens
-snapshot_every = 250
-save_embedding_snapshot(0)
+num_steps = 1000 # number of training steps
 for step in range(num_steps):
 
-    if batch_cursor == 0:
-        random.shuffle(example_order)
-    batch_indices = example_order[batch_cursor:batch_cursor + batch_size]
-    if len(batch_indices) < batch_size:
-        random.shuffle(example_order)
-        batch_indices += example_order[:batch_size - len(batch_indices)]
-    batch_cursor = (batch_cursor + batch_size) % len(examples)
+    # Take single document, tokenize it, surround it with BOS special token on both sides
+    doc = docs[step % len(docs)]
+    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
+    n = min(block_size, len(tokens) - 1)
 
-    # Feed batches of "a b" and train only the next-token prediction for the answer.
-    batch = [examples[i] for i in batch_indices]
-    prompt_tokens = torch.tensor([encode_prompt(a, b) for a, b, _ in batch], dtype=torch.long, device=device)
-    target_ids = torch.tensor([stoi[str(target)] for _, _, target in batch], dtype=torch.long, device=device)
-
-    logits = model(prompt_tokens)
-    loss = F.cross_entropy(logits[:, -1, :], target_ids)
+    # Forward the token sequence through the model, building up the computation graph all the way to the loss
+    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    losses = []
+    for pos_id in range(n):
+        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
+        logits = gpt(token_id, pos_id, keys, values)
+        probs = softmax(logits)
+        loss_t = -probs[target_id].log()
+        losses.append(loss_t)
+    loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
 
     # Backward the loss, calculating the gradients with respect to all model parameters
-    optimizer.zero_grad(set_to_none=True)
     loss.backward()
 
-    # AdamW update with a constant learning rate: grokking happens late in training,
-    # so the LR must not decay to zero before the transition
-    optimizer.step()
+    # Adam optimizer update: update the model parameters based on the corresponding gradients
+    lr_t = learning_rate * (1 - step / num_steps) # linear learning rate decay
+    for i, p in enumerate(params):
+        m[i] = beta1 * m[i] + (1 - beta1) * p.grad
+        v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
+        m_hat = m[i] / (1 - beta1 ** (step + 1))
+        v_hat = v[i] / (1 - beta2 ** (step + 1))
+        p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
+        p.grad = 0
 
-    if (step + 1) % log_every == 0 or step == 0:
-        train_loss, _, _, train_acc = evaluate_split(train_eval_inputs, train_eval_targets)
-        val_loss, _, _, val_acc = evaluate_split(val_eval_inputs, val_eval_targets)
-        print(f"step {step+1:6d} / {num_steps:6d} | train loss {train_loss:.4f} | train acc {train_acc:.3f} | val loss {val_loss:.4f} | val acc {val_acc:.3f}")
-        metrics_log.write(f"{step+1},{train_loss:.6f},{train_acc:.6f},{val_loss:.6f},{val_acc:.6f}\n")
-        metrics_log.flush()
+    print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}", end='\r')
 
-    if (step + 1) % snapshot_every == 0:
-        save_embedding_snapshot(step + 1)
-
-save_embedding_snapshot(num_steps)
-metrics_log.close()
-print(f"saved metrics log to {METRICS_LOG_PATH}")
-print(f"saved embedding snapshots to {SNAPSHOT_DIR}")
-
-# Inference: evaluate train and held-out splits separately
-print("\n--- evaluation ---")
-train_loss, tc, tt, train_acc = evaluate_split(train_eval_inputs, train_eval_targets)
-val_loss, vc, vt, val_acc = evaluate_split(val_eval_inputs, val_eval_targets)
-print(f"train:    loss {train_loss:.4f} | accuracy {tc}/{tt} = {train_acc:.3f}")
-print(f"held-out: loss {val_loss:.4f} | accuracy {vc}/{vt} = {val_acc:.3f}")
-print("--- samples ---")
-sample_pairs = [
-    (0, 0),
-    (1 % MODULUS, (MODULUS // 3) % MODULUS),
-    (MODULUS // 4, (MODULUS // 2 + 3) % MODULUS),
-    (MODULUS - 4, MODULUS - 5),
-    (MODULUS - 1, MODULUS - 1),
-]
-for a, b in sample_pairs:
-    print(f"{a} + {b} = {predict(a, b)} (target {(a + b) % MODULUS})")
-
-save_number_vectors(NUMBER_VECTOR_PATH, EFFECTIVE_NUMBER_VECTOR_PATH)
-print(f"saved raw number vectors to {NUMBER_VECTOR_PATH}")
-print(f"saved effective number vectors to {EFFECTIVE_NUMBER_VECTOR_PATH}")
+# Inference: may the model babble back to us
+temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
+print("\n--- inference (new, hallucinated names) ---")
+for sample_idx in range(20):
+    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    token_id = BOS
+    sample = []
+    for pos_id in range(block_size):
+        logits = gpt(token_id, pos_id, keys, values)
+        probs = softmax([l / temperature for l in logits])
+        token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+        if token_id == BOS:
+            break
+        sample.append(uchars[token_id])
+    print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
