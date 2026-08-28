@@ -1,7 +1,6 @@
 # 정렬 Grokking 실행 가이드
 
-이 문서는 데이터 생성부터 세 정렬 과제 학습, RunPod GPU 실행, 체크포인트 재개,
-학습 sweep과 그래프 생성까지의 사용법을 설명한다.
+이 문서는 데이터 생성부터 세 정렬 과제 학습, RunPod GPU 실행, 체크포인트 재개, 학습 sweep과 그래프 생성까지의 사용법을 설명한다.
 
 
 | 파일                                   | 역할                                     |
@@ -36,8 +35,7 @@ python sweep.py --selftest
 python plot_grokking.py --selftest
 ```
 
-`--smoke`는 작은 데이터로 학습, 평가, 자유 생성, CSV 기록 경로를 확인한다.
-설치 검사용이므로 해당 결과를 grokking 실험 결과로 사용하지 않는다.
+`--smoke`는 작은 데이터로 학습, 평가, 자유 생성, CSV 기록 경로를 확인한다. 설치 검사용이므로 해당 결과를 grokking 실험 결과로 사용하지 않는다.
 
 ## 3. 데이터 생성
 
@@ -99,24 +97,26 @@ train 크기는 다음 식으로 정확히 결정된다.
 round(C(n,m) * train_percent / 100)
 ```
 
-조합 공간이 큰 상태에서 `--n-test -1`을 사용하면 test는 최대 50,000개로 제한된다.
-동일한 옵션과 seed를 사용하면 동일한 split이 생성된다.
+조합 공간이 큰 상태에서 `--n-test -1`을 사용하면 test는 최대 50,000개로 제한된다. 동일한 옵션과 seed를 사용하면 동일한 split이 생성된다.
 
 ### Coverage metadata
 
-`metadata.json`의 `coverage.elements`에는 train 원소의 정확한 coverage와 등장 빈도
-`frequency_min`, `frequency_max`, `frequency_mean`, `frequency_std`가 항상 기록된다.
+`metadata.json`의 `coverage.elements`에는 train 원소의 정확한 coverage와 등장 빈도 `frequency_min`, `frequency_max`, `frequency_mean`, `frequency_std`가 항상 기록된다.
 
-pair 분석은 train과 test에서 추적할 수 있는 unique pair 수의 보수적 합계가 안전 한도
-1,000,000 이하일 때만 정확히
-계산한다. 이때 `coverage.pairs`에는 train pair coverage와 같은 빈도 요약 외에 다음 값이 기록된다.
+pair 분석은 다음 값이 안전 한도 1,000,000 이하일 때만 정확히 계산한다.
+
+```text
+min(C(n,2), train_count * C(m,2)) + min(C(n,2), test_count * C(m,2))
+```
+
+각 항은 해당 split에서 추적할 수 있는 unique pair 수의 상한이며, train과 test 양쪽을 합산한다. `--n-test`를 크게 잡으면 두 번째 항 때문에 한도를 넘을 수 있다.
+
+이때 `coverage.pairs`에는 train pair coverage와 같은 빈도 요약 외에 다음 값이 기록된다.
 
 - test의 전체 pair occurrence와 그중 train에서 본 occurrence 수 및 비율
 - test의 unique pair 수와 그중 train에서 본 unique pair 수 및 비율
 
-한도를 넘으면 `coverage.pairs.status`는 `skipped`다. 이 경우 `reason`, `possible`,
-`potential_train_occurrences`, `potential_test_occurrences`를 기록하며 pair coverage나 test 비율을
-추정하지 않는다.
+한도를 넘으면 `coverage.pairs.status`는 `skipped`다. 이 경우 `reason`, `possible`, `potential_train_occurrences`, `potential_test_occurrences`를 기록하며 pair coverage나 test 비율을 추정하지 않는다.
 
 ## 4. 세 과제 학습
 
@@ -225,8 +225,7 @@ GPU 메모리가 부족하면 먼저 학습 및 평가 배치를 낮춘다.
 | `input-only`  | 입력에 있는 값. 같은 값을 다시 출력할 수 있다.                  |
 | `free`        | 전체 vocabulary의 값. 입력 밖의 값도 출력할 수 있다.            |
 
-기본값 `permutation`은 모델이 순서 규칙에 집중하게 하지만 과제를 쉽게 만들어 grokking 구간을
-줄일 수 있다. `input-only`와 `free`를 대조군으로 함께 비교하는 것이 좋다.
+기본값 `permutation`은 모델이 순서 규칙에 집중하게 하지만 과제를 쉽게 만들어 grokking 구간을 줄일 수 있다. `input-only`와 `free`를 대조군으로 함께 비교하는 것이 좋다.
 
 ```bash
 python sortformer.py \
@@ -294,21 +293,13 @@ CSV의 주요 지표는 다음과 같다.
 | `exact_acc`            | 자유 생성 전체가 target 순서까지 같은 비율                |
 | `weight_norm`          | 전체 파라미터 L2 norm                                     |
 
-CSV 열 이름은 split prefix를 붙인 `train_gen_in_set_token_acc`, `test_gen_in_set_token_acc`,
-`train_set_acc`, `test_set_acc`, `train_exact_acc`, `test_exact_acc`다. 생성 지표 세 개를 함께 보면
-입력 원소 사용, 중복/누락 없는 집합 완성, 올바른 정렬 순서를 차례로 구분할 수 있다.
-`permutation`에서는 in-set과 set 지표가 구조적으로 1이고, `input-only`에서는 in-set만 구조적으로
-1이므로 constraint 간 비교에서 이 점을 고려한다.
+CSV 열 이름은 split prefix를 붙인 `train_gen_in_set_token_acc`, `test_gen_in_set_token_acc`, `train_set_acc`, `test_set_acc`, `train_exact_acc`, `test_exact_acc`다. 생성 지표 세 개를 함께 보면 입력 원소 사용, 중복/누락 없는 집합 완성, 올바른 정렬 순서를 차례로 구분할 수 있다. `permutation`에서는 in-set과 set 지표가 구조적으로 1이고, `input-only`에서는 in-set만 구조적으로 1이므로 constraint 간 비교에서 이 점을 고려한다.
 
-teacher-forced `loss`와 `token_acc`도 각 constraint의 후보 공간에서 계산된다. 특히
-`permutation`의 마지막 위치는 남은 값이 하나라 구조적으로 정답이다. 따라서 이 두 값은 서로 다른
-constraint의 난이도를 직접 비교하기보다 동일 constraint 안에서 학습 추세를 보는 용도로 사용한다.
+teacher-forced `loss`와 `token_acc`도 각 constraint의 후보 공간에서 계산된다. 특히 `permutation`의 마지막 위치는 남은 값이 하나라 구조적으로 정답이다. 따라서 이 두 값은 서로 다른 constraint의 난이도를 직접 비교하기보다 동일 constraint 안에서 학습 추세를 보는 용도로 사용한다.
 
-CSV의 `run_signature_sha256`은 resume 시 task, output constraint, 데이터셋이 같은 실행인지
-검증하는 식별자다.
+CSV의 `run_signature_sha256`은 resume 시 task, output constraint, 데이터셋이 같은 실행인지 검증하는 식별자다.
 
-실제 grokking 판정에서는 `train_exact_acc`와 `test_exact_acc`를 사용한다. 전이 시점을 정확히
-측정하려면 다음 옵션으로 split 전체를 평가한다.
+실제 grokking 판정에서는 `train_exact_acc`와 `test_exact_acc`를 사용한다. 전이 시점을 정확히 측정하려면 다음 옵션으로 split 전체를 평가한다.
 
 ```bash
 --n-eval -1
@@ -350,11 +341,9 @@ python sortformer.py \
   --ckpt-every 10000
 ```
 
-`--steps`는 추가 학습량이 아니라 최종 도달 step이다. 체크포인트에는 모델, optimizer, AMP scaler,
-난수 상태, task, 데이터셋 fingerprint가 저장된다. 현재 task 또는 데이터셋이 다르면 실행을 거부한다.
+`--steps`는 추가 학습량이 아니라 최종 도달 step이다. 체크포인트에는 모델, optimizer, AMP scaler, 난수 상태, task, 데이터셋 fingerprint가 저장된다. 현재 task 또는 데이터셋이 다르면 실행을 거부한다.
 
-CSV가 체크포인트보다 뒤 step까지 기록돼 있으면 서로 다른 학습 trajectory가 섞이지 않도록 새 CSV를
-사용한다.
+CSV가 체크포인트보다 뒤 step까지 기록돼 있으면 서로 다른 학습 trajectory가 섞이지 않도록 새 CSV를 사용한다.
 
 ```bash
 --log-csv runs/ascending_resumed.csv
@@ -386,8 +375,7 @@ glob 패턴도 사용할 수 있다.
 python plot_grokking.py "runs/*.csv" --out runs/grokking.png
 ```
 
-그래프는 네 panel로 train/test exact accuracy, test 생성 분해(in-set token/set/exact), loss,
-parameter L2 norm을 표시한다. 기본 x축은 로그 스케일이다. 선형 x축은 다음 옵션을 사용한다.
+그래프는 네 panel로 train/test exact accuracy, test 생성 분해(in-set token/set/exact), loss, parameter L2 norm을 표시한다. 기본 x축은 로그 스케일이다. 선형 x축은 다음 옵션을 사용한다.
 
 ```bash
 --linear-x
@@ -425,8 +413,7 @@ python sweep.py \
   --eval-batch 4096
 ```
 
-`--data`를 사용하면 모든 run이 같은 split을 공유한다. 이 모드에서 `--train-percents`는 sweep하지
-않으며, 지정한다면 값 하나만 허용된다.
+`--data`를 사용하면 모든 run이 같은 split을 공유한다. 이 모드에서 `--train-percents`는 sweep하지 않으며, 지정한다면 값 하나만 허용된다.
 
 ### 생성 데이터의 train 비율 비교
 
@@ -444,8 +431,7 @@ python sweep.py \
   --batch-size -1 --eval-every 250 --n-eval -1 --device auto
 ```
 
-`--` 뒤의 옵션은 모든 `sortformer.py` 실행에 전달된다. sweep이 직접 관리하는 데이터, task,
-seed, weight decay, 출력 제약, step, 로그 및 체크포인트 경로는 뒤에서 다시 지정할 수 없다.
+`--` 뒤의 옵션은 모든 `sortformer.py` 실행에 전달된다. sweep이 직접 관리하는 데이터, task, seed, weight decay, 출력 제약, step, 로그 및 체크포인트 경로는 뒤에서 다시 지정할 수 없다.
 
 출력 디렉터리에는 run별 CSV와 체크포인트 디렉터리 외에 다음 파일이 생긴다.
 
@@ -454,9 +440,7 @@ sweep_manifest.json
 sweep_summary.csv
 ```
 
-manifest는 각 명령, 설정, 상태와 artifact 경로를 기록한다. summary는 완료된 run을 task, 데이터 또는
-train 비율, weight decay, 출력 제약별로 묶어 test 90% 도달 수, grokking gap, 최종 exact accuracy를
-seed에 걸쳐 집계한다.
+manifest는 각 명령, 설정, 상태와 artifact 경로를 기록한다. summary는 완료된 run을 task, 데이터 또는 train 비율, weight decay, 출력 제약별로 묶어 test 90% 도달 수, grokking gap, 최종 exact accuracy를 seed에 걸쳐 집계한다.
 
 
 | 옵션                  | 동작                                                                            |
@@ -491,6 +475,4 @@ python sortformer.py \
   --out-dir runs/baseline
 ```
 
-전이가 너무 빠르면 `--train-percent`를 낮추거나 `--output-constraint free`를 사용한다. train은
-암기하지만 test가 오르지 않으면 train 비율이나 총 step을 늘린다. 유망한 설정을 찾은 뒤 seed를
-최소 3개 사용해 우연한 전이와 구분하는 것이 좋다.
+전이가 너무 빠르면 `--train-percent`를 낮추거나 `--output-constraint free`를 사용한다. train은 암기하지만 test가 오르지 않으면 train 비율이나 총 step을 늘린다. 유망한 설정을 찾은 뒤 seed를 최소 3개 사용해 우연한 전이와 구분하는 것이 좋다.
