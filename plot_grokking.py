@@ -25,6 +25,12 @@ REQUIRED_COLUMNS = (
     "test_set_acc",
     "test_exact_acc",
 )
+STRATA = ("direct", "transitive", "unresolved")
+STRATA_COLUMNS = tuple(
+    column
+    for name in STRATA
+    for column in (f"test_{name}_exact_acc", f"test_{name}_count")
+)
 
 
 class LogError(ValueError):
@@ -43,6 +49,12 @@ class Run:
     test_gen_in_set_token_acc: list[float]
     test_set_acc: list[float]
     test_exact_acc: list[float]
+    test_direct_exact_acc: list[float]
+    test_direct_count: list[float]
+    test_transitive_exact_acc: list[float]
+    test_transitive_count: list[float]
+    test_unresolved_exact_acc: list[float]
+    test_unresolved_count: list[float]
 
 
 @dataclass(frozen=True)
@@ -72,6 +84,12 @@ def _number(value: str | None, path: Path, row: int, column: str) -> float:
     return number
 
 
+def _optional_number(value: str | None, path: Path, row: int, column: str) -> float:
+    if value is None or not value.strip():
+        return math.nan
+    return _number(value, path, row, column)
+
+
 def load_run(path: str | os.PathLike[str]) -> Run:
     log_path = Path(path)
     try:
@@ -86,12 +104,15 @@ def load_run(path: str | os.PathLike[str]) -> Run:
         fieldnames = [name.strip() if name is not None else "" for name in reader.fieldnames]
         if len(fieldnames) != len(set(fieldnames)):
             raise LogError(f"{log_path}: CSV header contains duplicate columns")
-        missing = [name for name in REQUIRED_COLUMNS if name not in fieldnames]
+        missing = [
+            name for name in REQUIRED_COLUMNS + STRATA_COLUMNS
+            if name not in fieldnames
+        ]
         if missing:
             raise LogError(f"{log_path}: missing required columns: {', '.join(missing)}")
         reader.fieldnames = fieldnames
 
-        values = {name: [] for name in REQUIRED_COLUMNS}
+        values = {name: [] for name in REQUIRED_COLUMNS + STRATA_COLUMNS}
         run_kinds: list[tuple[str, str]] = []
         for row_number, row in enumerate(reader, start=2):
             if None in row:
@@ -100,6 +121,10 @@ def load_run(path: str | os.PathLike[str]) -> Run:
                 continue
             for column in REQUIRED_COLUMNS:
                 values[column].append(_number(row.get(column), log_path, row_number, column))
+            for column in STRATA_COLUMNS:
+                values[column].append(
+                    _optional_number(row.get(column), log_path, row_number, column)
+                )
             task = (row.get("task") or "").strip()
             constraint = (row.get("output_constraint") or "").strip()
             kind = (task, constraint)
@@ -217,7 +242,7 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
                 f"(no positive step: {', '.join(invalid)})"
             )
 
-    fig, axes = plt.subplots(1, 4, figsize=(19, 4.8), sharex=True)
+    fig, axes = plt.subplots(1, 5, figsize=(23, 4.8), sharex=True)
     colors = plt.get_cmap("tab10")
     positive_losses = True
     for index, run in enumerate(runs):
@@ -238,9 +263,23 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
         axes[1].plot(x, test_in_set, ":", color=color, label=f"{run.label} in-set token")
         axes[1].plot(x, test_set, "--", color=color, label=f"{run.label} set")
         axes[1].plot(x, test_exact, "-", color=color, label=f"{run.label} exact")
-        axes[2].plot(x, train_loss, "--", color=color, label=f"{run.label} train")
-        axes[2].plot(x, test_loss, "-", color=color, label=f"{run.label} test")
-        axes[3].plot(x, norm, color=color, label=run.label)
+        styles = {"direct": ":", "transitive": "-", "unresolved": "--"}
+        for name in STRATA:
+            accuracy = getattr(run, f"test_{name}_exact_acc")
+            counts = getattr(run, f"test_{name}_count")
+            stratum_points = [
+                i for i in points
+                if math.isfinite(accuracy[i]) and counts[i] > 0
+            ]
+            if stratum_points:
+                axes[2].plot(
+                    [run.step[i] for i in stratum_points],
+                    [accuracy[i] for i in stratum_points],
+                    styles[name], color=color, label=f"{run.label} {name}",
+                )
+        axes[3].plot(x, train_loss, "--", color=color, label=f"{run.label} train")
+        axes[3].plot(x, test_loss, "-", color=color, label=f"{run.label} test")
+        axes[4].plot(x, norm, color=color, label=run.label)
 
     axes[0].set_title("Exact accuracy")
     axes[0].set_ylabel("Accuracy")
@@ -248,12 +287,15 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
     axes[1].set_title("Test generation decomposition")
     axes[1].set_ylabel("Accuracy")
     axes[1].set_ylim(-0.02, 1.02)
-    axes[2].set_title("Loss")
-    axes[2].set_ylabel("Loss")
-    axes[3].set_title("Parameter L2 norm")
-    axes[3].set_ylabel("L2 norm")
+    axes[2].set_title("Test strata exact")
+    axes[2].set_ylabel("Accuracy")
+    axes[2].set_ylim(-0.02, 1.02)
+    axes[3].set_title("Loss")
+    axes[3].set_ylabel("Loss")
+    axes[4].set_title("Parameter L2 norm")
+    axes[4].set_ylabel("L2 norm")
     if positive_losses:
-        axes[2].set_yscale("log")
+        axes[3].set_yscale("log")
     else:
         print("warning: nonpositive loss found; using a linear loss axis", file=sys.stderr)
 
@@ -280,13 +322,15 @@ def selftest() -> None:
         "train_gen_in_set_token_acc", "train_set_acc", "train_exact_acc",
         "test_loss", "test_token_acc", "test_gen_in_set_token_acc",
         "test_set_acc", "test_exact_acc", "elapsed_seconds", "task",
-        "output_constraint",
+        "output_constraint", "test_direct_exact_acc", "test_direct_count",
+        "test_transitive_exact_acc", "test_transitive_count",
+        "test_unresolved_exact_acc", "test_unresolved_count",
     ]
     rows = [
-        [0, .001, 2.0, 1.0, .1, .4, .1, .2, 1.2, .1, .3, .1, .1, 0, "sort", "free"],
-        [20, .001, 2.5, .01, 1, 1, 1, 1, .4, .8, .95, .92, .91, 2, "sort", "free"],
-        [10, .001, 2.3, .1, 1, 1, 1, .995, .7, .5, .8, .6, .4, 1, "sort", "free"],
-        [30, .001, 2.7, .001, 1, 1, 1, 1, .01, 1, 1, 1, .995, 3, "sort", "free"],
+        [0, .001, 2.0, 1.0, .1, .4, .1, .2, 1.2, .1, .3, .1, .1, 0, "sort", "free", .2, 4, .1, 4, "", 0],
+        [20, .001, 2.5, .01, 1, 1, 1, 1, .4, .8, .95, .92, .91, 2, "sort", "free", .95, 4, .9, 4, "", 0],
+        [10, .001, 2.3, .1, 1, 1, 1, .995, .7, .5, .8, .6, .4, 1, "sort", "free", .5, 4, .3, 4, "", 0],
+        [30, .001, 2.7, .001, 1, 1, 1, 1, .01, 1, 1, 1, .995, 3, "sort", "free", 1, 4, .99, 4, "", 0],
     ]
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "sample.csv"

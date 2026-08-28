@@ -22,24 +22,31 @@ from typing import Any, Sequence
 
 TASKS = ("ascending", "mod", "alternating")
 OUTPUT_CONSTRAINTS = ("permutation", "input-only", "free")
+SPLIT_STRATEGIES = ("random", "relation-complete")
 SUMMARY_FIELDS = (
     "task",
+    "train_count",
     "train_percent",
+    "split_strategy",
     "dataset",
     "weight_decay",
     "output_constraint",
     "runs",
     "successful_test90",
+    "successful_transitive90",
     "median_grokking_gap",
     "min_grokking_gap",
     "max_grokking_gap",
     "median_final_train_exact",
     "median_final_test_exact",
+    "median_final_transitive_exact",
     "csv_paths",
     "checkpoint_paths",
 )
 MANAGED_OPTIONS = {
-    "--data", "--task", "--n", "--m", "--train-percent", "--modulus",
+    "--data", "--task", "--n", "--m", "--train-count", "--train-counts",
+    "--train-percent", "--train-percents", "--split-strategy",
+    "--split-strategies", "--modulus",
     "--data-seed", "--n-test", "--seed", "--weight-decay",
     "--output-constraint", "--steps", "--log-csv", "--out-dir", "--resume",
     "--smoke",
@@ -101,17 +108,28 @@ def build_runs(args: argparse.Namespace, out_dir: Path) -> list[RunSpec]:
     weight_decays = unique(args.weight_decays)
     constraints = unique(args.output_constraints)
     if args.data is not None:
-        if len(args.train_percents) != 1:
-            raise SweepError("with --data, --train-percents must contain exactly one value")
+        if args.train_counts is not None and len(unique(args.train_counts)) != 1:
+            raise SweepError("with --data, --train-counts cannot contain multiple values")
+        if args.train_percents is not None and len(unique(args.train_percents)) != 1:
+            raise SweepError("with --data, --train-percents cannot contain multiple values")
+        if args.split_strategies is not None and len(unique(args.split_strategies)) != 1:
+            raise SweepError("with --data, --split-strategies cannot contain multiple values")
         data_path = args.data.expanduser().resolve()
         if not data_path.is_dir():
             raise SweepError(f"dataset directory does not exist: {data_path}")
-        train_percents: list[float | None] = [None]
+        train_sizes: list[tuple[int | None, float | None]] = [(None, None)]
+        split_strategies: list[str | None] = [None]
         dataset = str(data_path)
         dataset_label = f"data-{slug(data_path.name)}"
     else:
         data_path = None
-        train_percents = unique(args.train_percents)
+        if args.train_counts is not None:
+            train_sizes = [(value, None) for value in unique(args.train_counts)]
+        elif args.train_percents is not None:
+            train_sizes = [(None, value) for value in unique(args.train_percents)]
+        else:
+            train_sizes = [(128, None)]
+        split_strategies = unique(args.split_strategies or ["random"])
         dataset = "generated"
         dataset_label = "generated"
 
@@ -119,9 +137,10 @@ def build_runs(args: argparse.Namespace, out_dir: Path) -> list[RunSpec]:
     specs: list[RunSpec] = []
     used_ids: dict[str, dict[str, Any]] = {}
     combinations = itertools.product(
-        tasks, train_percents, weight_decays, constraints, seeds
+        tasks, train_sizes, split_strategies, weight_decays, constraints, seeds
     )
-    for task, train_percent, weight_decay, constraint, seed in combinations:
+    for task, train_size, split_strategy, weight_decay, constraint, seed in combinations:
+        train_count, train_percent = train_size
         config: dict[str, Any] = {
             "task": task,
             "seed": seed,
@@ -129,7 +148,9 @@ def build_runs(args: argparse.Namespace, out_dir: Path) -> list[RunSpec]:
             "output_constraint": constraint,
             "steps": args.steps,
             "dataset": dataset,
+            "train_count": train_count,
             "train_percent": train_percent,
+            "split_strategy": split_strategy,
             "forwarded_args": forwarded,
         }
         if data_path is None:
@@ -141,12 +162,14 @@ def build_runs(args: argparse.Namespace, out_dir: Path) -> list[RunSpec]:
                 "n_test": args.n_test,
             })
         digest = config_digest(config)
-        percent_label = (
-            f"tp-{number_label(train_percent)}"
-            if train_percent is not None else dataset_label
+        size_label = (
+            f"tc-{train_count}" if train_count is not None else
+            f"tp-{number_label(train_percent)}" if train_percent is not None else
+            dataset_label
         )
+        strategy_label = f"__ss-{split_strategy}" if split_strategy is not None else ""
         prefix = (
-            f"{task}__{percent_label}__wd-{number_label(weight_decay)}"
+            f"{task}__{size_label}{strategy_label}__wd-{number_label(weight_decay)}"
             f"__oc-{constraint}__seed-{seed}"
         )
         digest_length = 12
@@ -172,11 +195,14 @@ def build_runs(args: argparse.Namespace, out_dir: Path) -> list[RunSpec]:
         if data_path is not None:
             command.extend(("--data", str(data_path)))
         else:
+            command.extend(("--n", str(args.n), "--m", str(args.m)))
+            if train_count is not None:
+                command.extend(("--train-count", str(train_count)))
+            else:
+                command.extend(("--train-percent", format(train_percent, ".17g")))
             command.extend((
-                "--n", str(args.n), "--m", str(args.m),
-                "--train-percent", format(train_percent, ".17g"),
-                "--modulus", str(args.modulus), "--data-seed", str(args.data_seed),
-                "--n-test", str(args.n_test),
+                "--split-strategy", str(split_strategy), "--modulus", str(args.modulus),
+                "--data-seed", str(args.data_seed), "--n-test", str(args.n_test),
             ))
         command.extend(forwarded)
         specs.append(RunSpec(run_id, config, command, csv_path, checkpoint_path))
@@ -261,7 +287,7 @@ def finite_float(value: str | None, path: Path, row: int, field: str) -> float:
 
 def score_csv(path: Path) -> dict[str, float | None]:
     required = {"step", "train_exact_acc", "test_exact_acc"}
-    points: list[tuple[float, float, float]] = []
+    points: list[tuple[float, float, float, float | None]] = []
     try:
         handle = path.open("r", encoding="utf-8-sig", newline="")
     except OSError as exc:
@@ -274,17 +300,30 @@ def score_csv(path: Path) -> dict[str, float | None]:
         for row_number, row in enumerate(reader, start=2):
             if not any((value or "").strip() for value in row.values()):
                 continue
+            transitive_text = (row.get("test_transitive_exact_acc") or "").strip()
             points.append((
                 finite_float(row.get("step"), path, row_number, "step"),
                 finite_float(row.get("train_exact_acc"), path, row_number, "train_exact_acc"),
                 finite_float(row.get("test_exact_acc"), path, row_number, "test_exact_acc"),
+                (
+                    finite_float(
+                        transitive_text, path, row_number,
+                        "test_transitive_exact_acc",
+                    )
+                    if transitive_text else None
+                ),
             ))
     if not points:
         raise SweepError(f"{path}: CSV contains no data rows")
-    train99_steps = [step for step, train, _ in points if train >= 0.99]
-    test90_steps = [step for step, _, test in points if test >= 0.90]
+    train99_steps = [step for step, train, _, _ in points if train >= 0.99]
+    test90_steps = [step for step, _, test, _ in points if test >= 0.90]
+    transitive90_steps = [
+        step for step, _, _, transitive in points
+        if transitive is not None and transitive >= 0.90
+    ]
     train99 = min(train99_steps) if train99_steps else None
     test90 = min(test90_steps) if test90_steps else None
+    transitive90 = min(transitive90_steps) if transitive90_steps else None
     final = max(points, key=lambda point: point[0])
     gap = (
         test90 / train99
@@ -292,9 +331,11 @@ def score_csv(path: Path) -> dict[str, float | None]:
     )
     return {
         "test90": test90,
+        "transitive90": transitive90,
         "gap": gap,
         "final_train": final[1],
         "final_test": final[2],
+        "final_transitive": final[3],
     }
 
 
@@ -311,31 +352,45 @@ def aggregate(specs: Sequence[RunSpec], entries: dict[str, dict[str, Any]]) -> l
         score = score_csv(spec.csv_path)
         config = spec.config
         key = (
-            config["task"], config["train_percent"], config["dataset"],
-            config["weight_decay"], config["output_constraint"],
+            config["task"], config.get("train_count"), config.get("train_percent"),
+            config.get("split_strategy"), config["dataset"], config["weight_decay"],
+            config["output_constraint"],
         )
         groups.setdefault(key, []).append((spec, score))
 
     rows: list[dict[str, str]] = []
     for key in sorted(groups, key=lambda item: tuple("" if x is None else str(x) for x in item)):
-        task, train_percent, dataset, weight_decay, constraint = key
+        (task, train_count, train_percent, split_strategy, dataset, weight_decay,
+         constraint) = key
         runs = groups[key]
         gaps = [score["gap"] for _, score in runs if score["gap"] is not None]
         final_train = [score["final_train"] for _, score in runs]
         final_test = [score["final_test"] for _, score in runs]
+        final_transitive = [
+            score["final_transitive"] for _, score in runs
+            if score["final_transitive"] is not None
+        ]
         rows.append({
             "task": str(task),
+            "train_count": "" if train_count is None else str(train_count),
             "train_percent": metric(train_percent),
-            "dataset": str(dataset) if train_percent is None else "",
+            "split_strategy": "" if split_strategy is None else str(split_strategy),
+            "dataset": str(dataset) if train_count is None and train_percent is None else "",
             "weight_decay": metric(weight_decay),
             "output_constraint": str(constraint),
             "runs": str(len(runs)),
             "successful_test90": str(sum(score["test90"] is not None for _, score in runs)),
+            "successful_transitive90": str(
+                sum(score["transitive90"] is not None for _, score in runs)
+            ),
             "median_grokking_gap": metric(statistics.median(gaps) if gaps else None),
             "min_grokking_gap": metric(min(gaps) if gaps else None),
             "max_grokking_gap": metric(max(gaps) if gaps else None),
             "median_final_train_exact": metric(statistics.median(final_train)),
             "median_final_test_exact": metric(statistics.median(final_test)),
+            "median_final_transitive_exact": metric(
+                statistics.median(final_transitive) if final_transitive else None
+            ),
             "csv_paths": ";".join(str(spec.csv_path) for spec, _ in runs),
             "checkpoint_paths": ";".join(str(spec.checkpoint_path) for spec, _ in runs),
         })
@@ -353,18 +408,22 @@ def print_summary(rows: Sequence[dict[str, str]]) -> None:
     if not rows:
         print("summary: no completed runs")
         return
-    print("summary: task dataset/tp wd constraint runs test90 gap(median[min,max]) final(train,test)")
+    print("summary: task dataset/size split wd constraint runs test90/trans90 gap final(train,test,trans)")
     for row in rows:
-        dataset = row["train_percent"] or row["dataset"]
+        dataset = row["train_count"] or row["train_percent"] or row["dataset"]
+        split_strategy = row["split_strategy"] or "-"
         gap = row["median_grokking_gap"] or "-"
         bounds = (
             f"[{row['min_grokking_gap']},{row['max_grokking_gap']}]"
             if row["min_grokking_gap"] else ""
         )
         print(
-            f"  {row['task']} {dataset} {row['weight_decay']} {row['output_constraint']} "
-            f"{row['runs']} {row['successful_test90']} {gap}{bounds} "
-            f"({row['median_final_train_exact']},{row['median_final_test_exact']})"
+            f"  {row['task']} {dataset} {split_strategy} {row['weight_decay']} "
+            f"{row['output_constraint']} "
+            f"{row['runs']} {row['successful_test90']}/"
+            f"{row['successful_transitive90']} {gap}{bounds} "
+            f"({row['median_final_train_exact']},{row['median_final_test_exact']},"
+            f"{row['median_final_transitive_exact'] or '-'})"
         )
 
 
@@ -374,19 +433,26 @@ def selftest() -> None:
         root = Path(temporary)
         args = parser.parse_args([
             "--tasks", "ascending", "mod", "--seeds", "1", "2",
-            "--weight-decays", "0.1", "1", "--train-percents", "1", "2",
+            "--weight-decays", "0.1", "1", "--train-counts", "64", "128",
+            "--split-strategies", "random", "relation-complete",
             "--output-constraints", "permutation", "free", "--out-dir", str(root),
             "--", "--batch-size", "64", "--device", "cpu",
         ])
         specs = build_runs(args, root)
-        assert len(specs) == 32
-        assert len({spec.run_id for spec in specs}) == 32
+        assert len(specs) == 64
+        assert len({spec.run_id for spec in specs}) == 64
         assert all(spec.command[-4:] == ["--batch-size", "64", "--device", "cpu"] for spec in specs)
         assert all("--log-csv" in spec.command and "--out-dir" in spec.command for spec in specs)
+        assert {spec.config["train_count"] for spec in specs} == {64, 128}
+        assert {spec.config["split_strategy"] for spec in specs} == {
+            "random", "relation-complete"
+        }
+        assert all("--train-count" in spec.command and "--split-strategy" in spec.command for spec in specs)
 
         group_specs = [spec for spec in specs if (
             spec.config["task"] == "ascending"
-            and spec.config["train_percent"] == 1.0
+            and spec.config["train_count"] == 64
+            and spec.config["split_strategy"] == "random"
             and spec.config["weight_decay"] == 0.1
             and spec.config["output_constraint"] == "permutation"
         )]
@@ -416,6 +482,26 @@ def selftest() -> None:
         assert rows[0]["median_grokking_gap"] == "2.5"
         assert rows[0]["min_grokking_gap"] == "1" and rows[0]["max_grokking_gap"] == "4"
         assert rows[0]["median_final_test_exact"] == "0.9"
+        assert rows[0]["train_count"] == "64"
+        assert rows[0]["train_percent"] == "" and rows[0]["split_strategy"] == "random"
+
+        percent_args = parser.parse_args([
+            "--train-percents", "1", "2", "--split-strategies", "relation-complete",
+        ])
+        percent_specs = build_runs(percent_args, root)
+        assert len(percent_specs) == 2
+        assert all("--train-percent" in spec.command for spec in percent_specs)
+        assert all(spec.config["train_count"] is None for spec in percent_specs)
+
+        data_args = parser.parse_args([
+            "--data", str(root), "--train-counts", "64",
+            "--split-strategies", "relation-complete",
+        ])
+        data_specs = build_runs(data_args, root)
+        assert len(data_specs) == 1
+        assert data_specs[0].config["train_count"] is None
+        assert data_specs[0].config["split_strategy"] is None
+        assert "--train-count" not in data_specs[0].command
     print("sweep selftest passed")
 
 
@@ -430,7 +516,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=["ascending"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42])
     parser.add_argument("--weight-decays", nargs="+", type=float, default=[1.0])
-    parser.add_argument("--train-percents", nargs="+", type=float, default=[2.0])
+    sizing = parser.add_mutually_exclusive_group()
+    sizing.add_argument("--train-counts", nargs="+", type=int)
+    sizing.add_argument("--train-percents", nargs="+", type=float)
+    parser.add_argument("--split-strategies", nargs="+", choices=SPLIT_STRATEGIES)
     parser.add_argument(
         "--output-constraints", nargs="+", choices=OUTPUT_CONSTRAINTS,
         default=["permutation"],
@@ -458,7 +547,12 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SweepError("--modulus must be positive")
         if args.n_test < -1:
             raise SweepError("--n-test must be -1 or nonnegative")
-        if any(not math.isfinite(value) or not 0 < value < 100 for value in args.train_percents):
+        if args.train_counts is not None and any(value < 1 for value in args.train_counts):
+            raise SweepError("--train-counts must be positive")
+        if args.train_percents is not None and any(
+            not math.isfinite(value) or not 0 < value < 100
+            for value in args.train_percents
+        ):
             raise SweepError("--train-percents must be finite and between 0 and 100")
 
 

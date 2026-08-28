@@ -19,18 +19,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sortdata import DatasetConfig, SortExample, iter_examples, load_dataset, split_ranks
+from sortdata import (
+    DatasetConfig,
+    SortExample,
+    classify_test_example,
+    combination_rank,
+    compute_train_comparison_information,
+    iter_examples,
+    load_dataset,
+    split_ranks,
+)
 
 
 TASKS = ("ascending", "mod", "alternating")
 OUTPUT_CONSTRAINTS = ("permutation", "input-only", "free")
+STRATA = ("direct", "transitive", "unresolved")
 CSV_COLUMNS = (
     "step", "lr", "weight_norm", "train_loss", "train_token_acc",
     "train_gen_in_set_token_acc", "train_set_acc", "train_exact_acc",
     "test_loss", "test_token_acc", "test_gen_in_set_token_acc",
     "test_set_acc", "test_exact_acc", "elapsed_seconds", "task",
     "output_constraint", "run_signature_sha256", "train_eval_count",
-    "test_eval_count",
+    "test_eval_count", "test_direct_exact_acc", "test_transitive_exact_acc",
+    "test_unresolved_exact_acc", "test_direct_count", "test_transitive_count",
+    "test_unresolved_count",
 )
 
 
@@ -56,6 +68,8 @@ class Metrics:
     gen_in_set_token_acc: float
     set_acc: float
     exact_acc: float
+    strata_exact_acc: dict[str, float | None]
+    strata_counts: dict[str, int]
 
 
 class RMSNorm(nn.Module):
@@ -294,10 +308,13 @@ def evaluate(
     batch_size: int,
     device: torch.device,
     dtype_name: str,
+    strata: torch.Tensor | None = None,
 ) -> Metrics:
     model.eval()
     loss_sum = token_correct = in_set_correct = set_correct = exact_correct = 0.0
     token_count = inputs.numel()
+    strata_correct = {name: 0 for name in STRATA}
+    strata_counts = {name: 0 for name in STRATA}
     for selection in batches(len(inputs), batch_size):
         x = inputs[selection].to(device, non_blocking=device.type == "cuda")
         y = targets[selection].to(device, non_blocking=device.type == "cuda")
@@ -312,32 +329,50 @@ def evaluate(
         with amp_context(device, dtype_name):
             generated = model.generate(x)
         in_set_correct += generated.unsqueeze(-1).eq(x.unsqueeze(1)).any(dim=-1).sum().item()
-        exact_correct += generated.eq(y).all(dim=1).sum().item()
+        exact_matches = generated.eq(y).all(dim=1)
+        exact_correct += exact_matches.sum().item()
         set_correct += generated.sort(dim=1).values.eq(x.sort(dim=1).values).all(dim=1).sum().item()
+        if strata is not None:
+            batch_strata = strata[selection].to(device)
+            for index, name in enumerate(STRATA):
+                selected = batch_strata.eq(index)
+                strata_counts[name] += selected.sum().item()
+                strata_correct[name] += (exact_matches & selected).sum().item()
     return Metrics(
         loss_sum / token_count,
         token_correct / token_count,
         in_set_correct / token_count,
         set_correct / len(inputs),
         exact_correct / len(inputs),
+        {
+            name: (
+                strata_correct[name] / strata_counts[name]
+                if strata_counts[name] else None
+            )
+            for name in STRATA
+        },
+        strata_counts,
     )
 
 
-def load_examples(args: argparse.Namespace) -> tuple[list[SortExample], list[SortExample], int, int]:
+def load_examples(
+    args: argparse.Namespace,
+) -> tuple[list[SortExample], list[SortExample], DatasetConfig]:
     if args.data:
         loaded = load_dataset(args.data)
-        config = loaded.metadata["config"]
+        config = DatasetConfig(**loaded.metadata["config"])
         return (
             list(loaded.train.examples), list(loaded.test.examples),
-            int(config["n"]), int(config["m"]),
+            config,
         )
     config = DatasetConfig(
         n=args.n, m=args.m, train_percent=args.train_percent,
         modulus=args.modulus, seed=args.data_seed, n_test=args.n_test,
-        enumerate_limit=args.enumerate_limit,
+        enumerate_limit=args.enumerate_limit, train_count=args.train_count,
+        split_strategy=args.split_strategy,
     )
     train_ranks, test_ranks, _ = split_ranks(config)
-    return list(iter_examples(train_ranks, config)), list(iter_examples(test_ranks, config)), args.n, args.m
+    return list(iter_examples(train_ranks, config)), list(iter_examples(test_ranks, config)), config
 
 
 def subset_for_eval(
@@ -421,12 +456,25 @@ def train(args: argparse.Namespace) -> int:
         torch.cuda.manual_seed_all(args.seed)
         torch.set_float32_matmul_precision("high")
     device = choose_device(args.device)
-    train_examples, test_examples, vocab_size, set_size = load_examples(args)
+    train_examples, test_examples, data_config = load_examples(args)
+    vocab_size, set_size = data_config.n, data_config.m
     if not train_examples or not test_examples:
         raise ValueError("both train and test splits must contain at least one example")
     train_x, test_x = inputs_for(train_examples), inputs_for(test_examples)
     train_y = targets_for(train_examples, args.task)
     test_y = targets_for(test_examples, args.task)
+    train_ranks = [combination_rank(example.inputs, vocab_size) for example in train_examples]
+    comparison_information = compute_train_comparison_information(
+        train_ranks, data_config, args.task
+    )
+    stratum_ids = {name: index for index, name in enumerate(STRATA)}
+    test_strata = torch.tensor(
+        [
+            stratum_ids[classify_test_example(example, comparison_information)]
+            for example in test_examples
+        ],
+        dtype=torch.long,
+    )
     if device.type == "cuda":
         train_x, test_x = train_x.pin_memory(), test_x.pin_memory()
         train_y, test_y = train_y.pin_memory(), test_y.pin_memory()
@@ -499,6 +547,9 @@ def train(args: argparse.Namespace) -> int:
 
     eval_train_x, eval_train_y = subset_for_eval(train_x, train_y, args.n_eval)
     eval_test_x, eval_test_y = subset_for_eval(test_x, test_y, args.n_eval)
+    eval_test_strata = test_strata[: len(eval_test_x)]
+    if device.type == "cuda":
+        eval_test_strata = eval_test_strata.to(device)
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -547,7 +598,10 @@ def train(args: argparse.Namespace) -> int:
         should_eval = step == 1 or step % args.eval_every == 0 or step == args.steps
         if should_eval:
             train_metrics = evaluate(model, eval_train_x, eval_train_y, args.eval_batch, device, args.dtype)
-            test_metrics = evaluate(model, eval_test_x, eval_test_y, args.eval_batch, device, args.dtype)
+            test_metrics = evaluate(
+                model, eval_test_x, eval_test_y, args.eval_batch, device,
+                args.dtype, eval_test_strata,
+            )
             norm = parameter_norm(model)
             elapsed = time.perf_counter() - started
             print(
@@ -558,6 +612,14 @@ def train(args: argparse.Namespace) -> int:
                 f"in-set {test_metrics.gen_in_set_token_acc:.3f} "
                 f"set {test_metrics.set_acc:.3f} | {elapsed:.1f}s"
             )
+            strata_text = " ".join(
+                f"{name}="
+                f"{test_metrics.strata_exact_acc[name]:.3f}"
+                if test_metrics.strata_exact_acc[name] is not None
+                else f"{name}=-"
+                for name in STRATA
+            )
+            print(f"  test strata exact: {strata_text}")
             if args.log_csv:
                 write_csv(Path(args.log_csv), {
                     "step": step, "lr": learning_rate, "weight_norm": norm,
@@ -576,6 +638,14 @@ def train(args: argparse.Namespace) -> int:
                     "run_signature_sha256": run_signature_sha256,
                     "train_eval_count": len(eval_train_x),
                     "test_eval_count": len(eval_test_x),
+                    **{
+                        f"test_{name}_exact_acc": test_metrics.strata_exact_acc[name]
+                        for name in STRATA
+                    },
+                    **{
+                        f"test_{name}_count": test_metrics.strata_counts[name]
+                        for name in STRATA
+                    },
                 })
         if out_dir and args.ckpt_every and step % args.ckpt_every == 0:
             save_checkpoint(
@@ -620,7 +690,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", choices=TASKS, default="ascending")
     parser.add_argument("--n", type=int, default=20)
     parser.add_argument("--m", type=int, default=4)
-    parser.add_argument("--train-percent", type=float, default=2.0)
+    sizing = parser.add_mutually_exclusive_group()
+    sizing.add_argument("--train-count", type=int)
+    sizing.add_argument("--train-percent", type=float)
+    parser.add_argument(
+        "--split-strategy", choices=("random", "relation-complete"), default="random"
+    )
     parser.add_argument("--modulus", type=int, default=3)
     parser.add_argument("--data-seed", type=int, default=0)
     parser.add_argument("--n-test", type=int, default=-1)
@@ -679,11 +754,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("label-smoothing must be in [0, 1)")
     if args.label_smoothing and args.output_constraint != "free":
         raise ValueError("label smoothing requires --output-constraint free")
+    if not args.data and args.train_count is None and args.train_percent is None:
+        args.train_count = 128
 
 
 def apply_smoke_settings(args: argparse.Namespace) -> None:
     args.data = None
-    args.n, args.m, args.train_percent, args.n_test = 7, 3, 50.0, -1
+    args.n, args.m, args.train_count, args.train_percent, args.n_test = 7, 3, 18, None, 17
+    args.split_strategy = "random"
     args.n_embd, args.n_head = 32, 4
     args.n_enc_layer, args.n_layer = 1, 1
     args.steps, args.batch_size = 20, -1
