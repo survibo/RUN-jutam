@@ -165,25 +165,31 @@ CLI 기본값은 `permutation`이다. 전체 생성 과정을 평가하는 기�
 | `--n-eval`, `--eval-batch` | 4096, 1024 |
 | `--seed` | 42 |
 
-`--batch-size -1`은 full-batch다. `--n-eval -1`은 train/test 전체를 평가한다. test 20,000개 전체의 strata 지표가 필요하면 `--n-eval 20000` 또는 `-1`을 사용한다.
+양수 `--batch-size K`는 train 크기와 관계없이 매 step 정확히 K개를 복원추출한다. 따라서 train이 128개여도 `--batch-size 16384`는 실제 16,384개 행을 만들며, 중복 선택된 입력도 각 행에서 독립적으로 permutation된다. `--batch-size -1`만 각 train 행을 한 번씩 사용하는 full-batch다.
+
+`--n-eval -1`은 train/test 전체를 평가한다. 평가는 행을 반복하지 않으므로 실제 평가 batch는 `--eval-batch`, `--n-eval`, split 크기 중 가능한 범위로 제한된다. test 20,000개 전체의 strata 지표가 필요하면 `--n-eval 20000` 또는 `-1`을 사용한다.
 
 ## 5. RunPod GPU
 
-A100, A40, RTX 4090 등 bf16 GPU의 예시는 다음과 같다.
+A100, A40, RTX 4090/5090 등 bf16 GPU의 시작 예시는 다음과 같다.
 
 ```bash
 python sortformer.py \
   --data data/n50_m5_tc128_rc \
   --task ascending --output-constraint free \
   --device auto --dtype bfloat16 --compile \
-  --batch-size 2048 --eval-batch 4096 \
+  --batch-size 8192 --eval-batch 4096 \
   --steps 200000 --eval-every 250 --n-eval 20000 \
   --log-csv runs/ascending_rc_free.csv \
   --out-dir runs/ascending_rc_free \
   --ckpt-every 10000
 ```
 
-bf16 미지원 GPU는 `--dtype float16`을 사용한다. 메모리가 부족하면 `--batch-size`와 `--eval-batch`를 먼저 낮춘다. `--compile`은 첫 호출 비용이 있으므로 짧은 실행에서는 생략할 수 있다. `--device auto`는 `cuda`, `mps`, `cpu` 순으로 선택한다.
+CUDA에서는 train 입력과 target을 시작할 때 GPU에 올리고 index sampling, row permutation, forward/backward를 GPU에서 수행한다. test는 host pinned memory에서 평가 batch 단위로 전송한다.
+
+먼저 `--batch-size 8192`로 실행한 뒤 `8192`, `16384`, `32768`, `65536`, `131072` 순서로 높이며 `watch -n 0.5 nvidia-smi`로 utilization과 VRAM을 확인한다. 큰 batch에서 OOM이 발생하면 직전 크기로 낮춘다. 양수 batch 크기를 바꾸면 step당 표본 수와 gradient noise도 달라지므로 비교할 run들은 같은 batch size를 사용한다.
+
+bf16 미지원 GPU는 `--dtype float16`을 사용한다. 평가 중 메모리가 부족하면 `--eval-batch`를 낮춘다. `--compile`은 첫 호출 비용이 있으므로 짧은 실행에서는 생략할 수 있다. `--device auto`는 `cuda`, `mps`, `cpu` 순으로 선택한다.
 
 ## 6. 체크포인트 재개
 
@@ -194,7 +200,7 @@ python sortformer.py \
   --data data/n50_m5_tc128_rc \
   --task ascending --output-constraint free \
   --device auto --dtype bfloat16 --compile \
-  --batch-size 2048 --eval-batch 4096 \
+  --batch-size 8192 --eval-batch 4096 \
   --steps 200000 \
   --resume runs/ascending_rc_free/ckpt_00010000.pt \
   --log-csv runs/ascending_rc_free.csv \
@@ -221,7 +227,7 @@ python sweep.py \
   --out-dir sweeps/n50_m5_counts \
   -- \
   --device auto --dtype bfloat16 \
-  --batch-size 2048 --eval-batch 4096 \
+  --batch-size 8192 --eval-batch 4096 \
   --eval-every 250 --n-eval 20000
 ```
 
@@ -237,7 +243,7 @@ python sweep.py \
   --out-dir sweeps/fixed_rc \
   -- \
   --device auto --dtype bfloat16 \
-  --batch-size 2048 --eval-batch 4096
+  --batch-size 8192 --eval-batch 4096
 ```
 
 `--train-counts`와 `--train-percents`는 동시에 사용할 수 없다. generated-data mode에서 둘 다 생략하면 count 128 하나를 사용한다. 고정 `--data` mode에서 sizing 또는 split 목록을 지정할 때는 각각 한 값만 허용된다.

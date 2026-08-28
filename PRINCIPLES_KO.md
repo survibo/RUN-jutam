@@ -102,6 +102,8 @@ teacher-forced token accuracy가 높아도 자유 생성에서는 초반 오류�
 
 percentage보다 정확한 train count를 primary 축으로 사용하는 편이 조합 공간 크기가 다른 실험을 명확하게 비교할 수 있다. random 결과에서 unresolved 비율이 다르면 overall 정확도를 relation-complete 결과와 직접 같은 의미로 비교해서는 안 된다.
 
+양수 batch size는 복원추출 횟수이므로 값을 키우면 같은 train example의 여러 입력 permutation을 한 optimizer step에서 평균한다. 이는 GPU workload만 바꾸는 것이 아니라 gradient noise와 step당 표본 수를 바꾼다. 따라서 batch size가 다른 run을 동일한 학습 trajectory로 간주하지 않고, 주 비교에서는 batch size도 고정한다.
+
 ## 9. Coverage의 역할
 
 `elements`는 모든 값이 train에 나타났는지 확인한다. `pairs`는 임의의 값 쌍이 얼마나 직접 함께 관측됐는지 보여 준다. `adjacent_pairs`는 전체 target order를 연결하는 핵심 관계가 포함됐는지 보여 준다.

@@ -476,8 +476,9 @@ def train(args: argparse.Namespace) -> int:
         dtype=torch.long,
     )
     if device.type == "cuda":
-        train_x, test_x = train_x.pin_memory(), test_x.pin_memory()
-        train_y, test_y = train_y.pin_memory(), test_y.pin_memory()
+        # Training repeatedly samples a small split, so keep it resident on the GPU.
+        train_x, train_y = train_x.to(device), train_y.to(device)
+        test_x, test_y = test_x.pin_memory(), test_y.pin_memory()
     run_signature = {
         "task": args.task,
         "output_constraint": args.output_constraint,
@@ -539,6 +540,13 @@ def train(args: argparse.Namespace) -> int:
         f"train={len(train_x):,} test={len(test_x):,} "
         f"C({vocab_size},{set_size}) | params={sum(p.numel() for p in model.parameters()):,}"
     )
+    effective_batch_size = len(train_x) if args.batch_size == -1 else args.batch_size
+    sampling_mode = "full-batch" if args.batch_size == -1 else "with-replacement"
+    print(
+        f"train batch={effective_batch_size:,} sampling={sampling_mode} "
+        f"data_device={train_x.device} | eval_limit={args.n_eval:,} "
+        f"eval_batch={args.eval_batch:,}"
+    )
     if args.log_csv:
         validate_log_target(
             Path(args.log_csv), start_step if args.resume else None,
@@ -558,18 +566,24 @@ def train(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
     started = time.perf_counter()
-    batch_size = len(train_x) if args.batch_size == -1 else args.batch_size
+    batch_size = effective_batch_size
+    step_generator = torch.Generator(device=train_x.device)
+    full_batch_indices = (
+        torch.arange(len(train_x), device=train_x.device)
+        if args.batch_size == -1 else None
+    )
     for step in range(start_step + 1, args.steps + 1):
         model.train()
         learning_rate = lr_for_step(args, step)
         for group in optimizer.param_groups:
             group["lr"] = learning_rate
-        step_generator = torch.Generator().manual_seed(args.seed + step)
-        if batch_size >= len(train_x):
-            batch_indices = torch.arange(len(train_x))
+        step_generator.manual_seed(args.seed + step)
+        if full_batch_indices is not None:
+            batch_indices = full_batch_indices
         else:
             batch_indices = torch.randint(
-                len(train_x), (batch_size,), generator=step_generator
+                len(train_x), (batch_size,), device=train_x.device,
+                generator=step_generator,
             )
         x = shuffled_rows(train_x[batch_indices], step_generator)
         y = train_y[batch_indices]
@@ -712,7 +726,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--init-scale", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=100_000)
-    parser.add_argument("--batch-size", type=int, default=512, help="-1 uses full batch")
+    parser.add_argument(
+        "--batch-size", type=int, default=512,
+        help="positive values sample exactly that many rows with replacement; -1 uses each train row once",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.98)
@@ -728,7 +745,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--n-eval", type=int, default=4096)
-    parser.add_argument("--eval-batch", type=int, default=1024)
+    parser.add_argument(
+        "--eval-batch", type=int, default=1024,
+        help="evaluation chunk size; evaluation never repeats rows",
+    )
     parser.add_argument("--log-csv", type=Path)
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--ckpt-every", type=int, default=0)

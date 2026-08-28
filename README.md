@@ -136,7 +136,7 @@ python sortformer.py --n 50 --m 5 --modulus 5 --train-count 128 \
 
 기본값 `permutation`은 순서 규칙에 집중하게 하지만 과제를 구조적으로 쉽게 만들어 grokking 구간을 줄일 수 있다. 알고리즘 전체를 보려는 권장 기준은 `free`이고, 다른 두 모드는 출력 제약 대조군이다. label smoothing은 `free`에서만 허용된다.
 
-주요 기본값은 embedding 128, head 4, encoder/decoder 각 2층, batch 512, AdamW learning rate `1e-3`, weight decay `1.0`, warmup 100, constant schedule, 평가 간격 250, `--n-eval 4096`이다. `--batch-size -1`과 `--n-eval -1`은 각각 full-batch 학습과 split 전체 평가다.
+주요 기본값은 embedding 128, head 4, encoder/decoder 각 2층, batch 512, AdamW learning rate `1e-3`, weight decay `1.0`, warmup 100, constant schedule, 평가 간격 250, `--n-eval 4096`이다. 양수 `--batch-size K`는 train 크기와 관계없이 K개를 복원추출하고 `--batch-size -1`만 각 train 행을 한 번 사용하는 full-batch다. 평가는 행을 반복하지 않으며 `--n-eval -1`은 split 전체를 평가한다.
 
 ## RunPod / GPU
 
@@ -145,19 +145,19 @@ python sortformer.py --n 50 --m 5 --modulus 5 --train-count 128 \
 ```bash
 python sortformer.py --data data/n50_m5_tc128_rc --task ascending \
   --output-constraint free --device auto --dtype bfloat16 --compile \
-  --batch-size 2048 --eval-batch 4096 --steps 200000 \
+  --batch-size 8192 --eval-batch 4096 --steps 200000 \
   --log-csv runs/ascending_rc_free.csv --out-dir runs/ascending_rc_free \
   --ckpt-every 10000
 ```
 
-메모리가 부족하면 `--batch-size`와 `--eval-batch`부터 낮춘다. `--compile` 첫 호출은 느리므로 짧은 실험에서는 생략할 수 있다.
+CUDA에서는 train tensor, sampling과 입력 permutation을 GPU에서 처리한다. `--batch-size 8192`에서 시작해 utilization과 VRAM을 보며 `16384`, `32768`, `65536`, `131072` 순서로 높인다. 큰 batch는 학습 dynamics도 바꾸므로 비교 run에서는 같은 값을 사용한다. 메모리가 부족하면 `--batch-size`와 `--eval-batch`부터 낮춘다. `--compile` 첫 호출은 느리므로 짧은 실험에서는 생략할 수 있다.
 
 체크포인트는 모델, optimizer, AMP scaler, 난수 상태, 모델 설정과 run signature를 저장한다. `--steps`는 추가량이 아니라 최종 step이다.
 
 ```bash
 python sortformer.py --data data/n50_m5_tc128_rc --task ascending \
   --output-constraint free --device auto --dtype bfloat16 --compile \
-  --batch-size 2048 --eval-batch 4096 --steps 200000 \
+  --batch-size 8192 --eval-batch 4096 --steps 200000 \
   --resume runs/ascending_rc_free/ckpt_00010000.pt \
   --log-csv runs/ascending_rc_free.csv --out-dir runs/ascending_rc_free
 ```
@@ -175,7 +175,7 @@ python sweep.py --n 50 --m 5 --modulus 5 --data-seed 0 --n-test 20000 \
   --tasks ascending mod alternating --seeds 42 43 44 \
   --weight-decays 1.0 --output-constraints free --steps 200000 \
   --out-dir sweeps/n50_m5_counts -- \
-  --device auto --dtype bfloat16 --batch-size 2048 \
+  --device auto --dtype bfloat16 --batch-size 8192 \
   --eval-batch 4096 --eval-every 250 --n-eval 20000
 ```
 
