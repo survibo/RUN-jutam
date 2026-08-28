@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Default experiment output paths
+/data/
+/runs/
+/sweeps/
+/grokking.png
+
+# Keep the shared experiment directory layout, not generated contents.
+/experiments/data/*
+!/experiments/data/.gitkeep
+/experiments/runs/*
+!/experiments/runs/.gitkeep
+/experiments/sweeps/*
+!/experiments/sweeps/.gitkeep
+/experiments/plots/*
+!/experiments/plots/.gitkeep
