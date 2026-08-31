@@ -24,11 +24,14 @@
 | ---------------------------------------- | ------------------------------------------------------ |
 | [`sortdata.py`](sortdata.py)           | FORMAT v2 조합 split, 세 target, 관계 coverage 생성  |
 | [`sortformer.py`](sortformer.py)       | 자기회귀 Transformer 학습, strata 평가, 체크포인트   |
+| [`gpt_sortdata.py`](gpt_sortdata.py)   | GPT용 중복 없는 랜덤 순서 데이터 생성/검증           |
+| [`sortformer_gpt.py`](sortformer_gpt.py) | 단일 causal self-attention stack 기반 GPT 정렬 모델 |
 | [`sweep.py`](sweep.py)                 | train count, split 전략, seed와 하이퍼파라미터 sweep |
 | [`plot_grokking.py`](plot_grokking.py) | CSV의 다섯 panel 시각화와 grokking gap 계산          |
 | [`microgpt_org.py`](microgpt_org.py)   | 원본 microGPT 참고 코드                              |
 | [`USAGE_KO.md`](USAGE_KO.md)           | 설치, 실행 옵션과 운영 절차                          |
 | [`PRINCIPLES_KO.md`](PRINCIPLES_KO.md) | 실험 설계 원리와 결과 해석                           |
+| [`GPT_USAGE_KO.md`](GPT_USAGE_KO.md)   | causal GPT 데이터와 모델 실행법                      |
 
 ## 설치와 검증
 
@@ -38,6 +41,8 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 
 python sortdata.py --selftest
 python sortformer.py --smoke
+python gpt_sortdata.py --selftest
+python sortformer_gpt.py --smoke --output-constraint free
 python sweep.py --selftest
 python plot_grokking.py --selftest
 ```
