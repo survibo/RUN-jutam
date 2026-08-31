@@ -1,0 +1,3 @@
+python plot_grokking.py "runs/grok_20_4_32_test.csv" \
+  --out runs/grok_20_4_32_test.png \
+  --title "Sorting Grokking"
