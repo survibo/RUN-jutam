@@ -1,285 +1,363 @@
-# Entity–Value KB 정렬 Grokking 모델 사용법
+# EOS·Label Masking GPT 정렬 모델 사용법
 
-`sortformer_gpt_eos.py`는 하나의 GPT-2-style causal Transformer에 다음 두 task를
-동시에 학습시킨다.
+`sortformer_gpt_eos.py`는 숫자 입력과 정렬 결과를 하나의 causal language-model
+sequence로 연결해 학습하는 GPT-2-style decoder-only Transformer다. 숫자마다 정확히
+하나의 token을 사용하며 encoder, cross-attention, 외부 메모리, 정렬 전용 layer나
+출력 hard mask는 사용하지 않는다.
 
-1. 모든 entity의 atomic fact: `entity + ATTR → value`
-2. ID entity에서의 sorting: entity들을 KB value 오름차순으로 재배열
+기존 `sortformer_gpt.py`와 달리 다음을 명시적으로 지원한다.
 
-OOD entity도 atomic fact 학습에는 포함되지만 sorting training에는 절대 포함되지
-않는다. 최종 목표는 모델이 이미 암기한 OOD atomic knowledge와 ID에서 학습한 정렬
-규칙을 합성하여 OOD entity tuple을 정렬하는지 측정하는 것이다.
+- `BOS`, 입력, `SEP`, 정렬 결과, `EOS`를 포함하는 단일 sequence
+- 정렬 결과와 EOS에만 loss를 주는 label masking
+- 서로 겹치지 않는 train/validation/test 3-way split
+- validation 지표를 포함한 장기 grokking CSV 기록
+- AdamW, Adam, SGD 선택과 checkpoint 재개
 
-## 빠른 검증
+## 빠른 확인
+
+프로젝트 루트에서 다음을 실행한다.
 
 ```bash
 python sortformer_gpt_eos.py --smoke
-python plot_grokking.py --selftest
 ```
 
-`--smoke`는 entity 20개, ID/OOD 16/4, `k=3`인 작은 CPU 실험이다. Dataset
-integrity, padding, 두 task의 loss, free-running 생성과 평가 경로를 확인하기 위한
-것이며 성능 benchmark가 아니다.
+`--smoke`는 CPU에서 작은 조합 공간을 20 step 학습하며 모델 forward, label
+masking, 자유 생성과 세 split 평가를 확인한다. 성능 benchmark는 아니다.
 
-전체 옵션은 다음으로 확인한다.
+사용 가능한 옵션 전체는 다음으로 확인한다.
 
 ```bash
 python sortformer_gpt_eos.py --help
 ```
 
-## Vocabulary
+## Sequence와 label masking
 
-Entity, value, special token은 서로 겹치지 않는 ID 영역을 사용한다.
-
-```text
-Entity: E0000 ... E0999
-Value:  V0 ... V100
-Special: BOS SEP EOS PAD ATOM SORT ATTR
-```
-
-Entity token ID는 entity 이름만 나타낸다. 실행 시작 시 seed로 생성한 무작위 KB
-mapping이 value를 결정하므로 entity token ID 순서와 value 순서는 무관하다. 서로
-다른 entity가 같은 value를 갖는 것은 허용한다.
-
-## 두 causal-LM sequence
-
-Atomic fact는 다음처럼 직렬화한다.
+길이 `k`의 입력은 다음처럼 직렬화된다.
 
 ```text
-input_ids = [BOS, ATOM, ATTR, E001, SEP, V23, EOS]
-labels    = [  X,    X,    X,    X,   X, V23, EOS]
+[BOS, input_1, ..., input_k, SEP, sorted_1, ..., sorted_k, EOS]
 ```
 
-Sorting example은 value token을 입력에 넣지 않는다.
+예를 들어 입력이 `1, 23, 15`이면 full sequence와 label은 다음과 같다.
 
 ```text
-KB(E10)=23, KB(E42)=1, KB(E81)=15
-
-input_ids = [BOS, SORT, ATTR, E10, E42, E81, SEP, E42, E81, E10, EOS]
-labels    = [  X,    X,    X,   X,   X,   X,   X, E42, E81, E10, EOS]
+input_ids = [BOS, 1, 23, 15, SEP, 1, 15, 23, EOS]
+labels    = [  X, X,  X,  X,   X, 1, 15, 23, EOS]
 ```
 
-`X`는 `IGNORE_INDEX=-100`이다. Loss는 SEP 이후의 정답과 EOS에만 계산한다.
-Atomic과 sorting sequence 길이가 다르므로 shorter sequence는 오른쪽 PAD로 맞추고,
-PAD는 attention mask와 label mask 모두에서 제외한다.
+`X`는 PyTorch의 `ignore_index=-100`이다. Causal shift 후 `SEP` 위치의 hidden
+state가 첫 정답 `1`을 예측하며, 이후에는 teacher forcing으로 이전 정답 token을
+조건으로 다음 정답을 예측한다. 한 example에서 loss에 포함되는 token 수는 정렬된
+숫자 `k`개와 EOS를 합친 `k+1`개다.
 
-## 기본 실행
+Inference에서는 `[BOS, inputs..., SEP]`만 prompt로 주고 greedy decoding으로
+`k+1`개 위치를 생성한다. 이전에 생성한 token은 다음 단계 context에 다시 들어간다.
+
+## 기본 학습 실행
+
+아래 값들은 예시일 뿐이며 숫자 범위, `k`, split 크기와 모든 모델·optimizer
+설정은 CLI에서 바꿀 수 있다.
 
 ```bash
 python sortformer_gpt_eos.py \
-  --n-entities 1000 \
-  --id-fraction 0.9 \
-  --value-min 0 \
-  --value-max 100 \
-  --k 3 \
-  --phi 3.6 \
-  --validation-count 2000 \
-  --test-count 5000 \
-  --training-mode combined \
-  --n-layer 8 \
-  --n-embd 512 \
-  --n-head 16 \
+  --n 30 \
+  --minimum 0 \
+  --k 5 \
+  --train-count 500 \
+  --validation-count 1000 \
+  --test-count 1000 \
+  --split-strategy random \
+  --data-seed 0 \
+  --n-layer 4 \
+  --n-embd 256 \
+  --n-head 8 \
   --dropout 0.0 \
   --optimizer adamw \
   --lr 1e-3 \
   --weight-decay 1.0 \
-  --steps 100000 \
+  --steps 500000 \
   --batch-size 256 \
-  --eval-every 50 \
+  --eval-every 500 \
+  --n-eval -1 \
+  --eval-batch 1024 \
   --device auto \
   --dtype bfloat16 \
-  --log-csv runs/entity_kb/metrics.csv \
-  --out-dir runs/entity_kb \
+  --log-csv runs/gpt_eos/metrics.csv \
+  --out-dir runs/gpt_eos \
   --ckpt-every 10000
 ```
 
-각 수치는 CLI로 변경할 수 있다. `--m`, `--hidden-dim`, `--attention-heads`,
-`--layers`, `--n-test`는 각각 `--k`, `--n-embd`, `--n-head`, `--n-layer`,
-`--test-count`의 alias다. `--n-enc-layer`는 호환 옵션이며 `0`만 허용한다.
+`--m`은 `--k`, `--hidden-dim`은 `--n-embd`, `--attention-heads`는
+`--n-head`, `--layers`는 `--n-layer`, `--n-test`는 `--test-count`의 alias다.
+기존 GPT 실행 명령을 옮길 때 사용할 수 있다. Decoder-only 구조를 명확히 하기
+위한 호환 옵션 `--n-enc-layer`는 `0`만 허용한다.
 
-## KB와 ID/OOD split
+## Vocabulary와 숫자 범위
 
-`--data-seed` 하나에서 서로 독립적인 deterministic seed stream을 파생하여 다음을
-실행 시작 시 한 번만 생성한다.
+`--n N --minimum A`는 실제 숫자 `A, A+1, ..., A+N-1`을 만든다. 각 숫자는
+BPE나 문자열 분해 없이 하나의 token ID에 대응한다. 그 뒤에 `BOS`, `SEP`, `EOS`
+세 special token이 배치된다.
 
-- 각 entity의 value를 replacement sampling한 KB
-- entity를 무작위 permutation한 뒤 나눈 ID/OOD membership
-- ID sorting train과 unseen-combination validation tuple
-- OOD-only sorting test tuple
-- 각 sorting tuple의 고정 input permutation
-
-ID 개수는 `round(n_entities × id_fraction)`이다. ID/OOD 목록은 token 번호 구간으로
-자르지 않는다. `config.json`에는 실제 KB 전체와 ID/OOD entity 목록, seed와 dataset
-fingerprint가 저장된다.
-
-Sorting tuple 안에서 value가 중복되는 조합은 제외한다. 요청한 example 수가 가능한
-distinct-value 조합 수를 넘으면 학습 전에 오류가 발생한다.
-
-## φ와 sorting 데이터 수
-
-이 구현에서 φ는 다음과 같이 정확히 정의한다.
+예를 들어 `--n 24 --minimum 0`이면 다음과 같다.
 
 ```text
-phi = ID sorting training example 수 / ID atomic fact 수
-sorting_train_count = round(ID entity 수 × phi)
+number token IDs: 0 ... 23
+BOS: 24
+SEP: 25
+EOS: 26
+model vocabulary size: 27
 ```
 
-따라서 ID entity가 900개일 때 `--phi 3.6`은 3240개, `--phi 7.2`는
-6480개의 sorting training example을 만든다. 정확한 개수를 직접 지정하려면 다음을
-사용한다.
+입력은 `N`개 숫자 중 중복 없이 `k`개를 뽑은 조합이다. 전체 가능한 조합 수는
+`C(N, k)`이며, 같은 underlying combination의 다른 입력 순서가 서로 다른 split에
+들어가지 않는다.
+
+## Train/validation/test split
+
+Train 크기는 다음 중 하나만 지정한다.
 
 ```bash
---sorting-train-count 3240
+--train-count 500
 ```
-
-`--phi`와 `--sorting-train-count`는 상호 배타적이다. 둘 다 생략하면 φ=3.6을
-사용한다. Validation은 sorting train에서 사용하지 않은 ID combination이고 test는
-OOD entity로만 이루어진 combination이다.
-
-## 고정 데이터와 input permutation
-
-기본값에서는 KB, split, example 행 순서와 각 sorting input의 entity 순서를 시작
-시점에 한 번 고정한다. 학습 중 재표본화하거나 다시 섞지 않는다. 양수 batch는 이
-고정된 행 순서를 cyclic하게 읽으며 `--batch-size -1`은 combined pool 전체를 매
-step 사용한다.
-
-Input permutation augmentation이 필요한 별도 대조 실험에서만 다음을 지정한다.
 
 ```bash
---dynamic-input-permutation
+--train-percent 10
 ```
 
-이 옵션은 선택된 sorting training input의 entity 순서만 step seed로 다시 섞는다.
-Validation/test와 target은 항상 고정이다. 기본값은 false이며 설정은 config, CSV와
-checkpoint signature에 기록된다.
+둘 다 생략하면 기존 실행 관례와 같이 train count 128을 사용한다. Validation과
+test는 `--validation-count`, `--test-count`로 지정한다.
 
-## Atomic/sorting task mixture
+- 둘 다 `-1`이면 train을 제외한 나머지를 절반씩 나눈다.
+- 하나만 `-1`이면 명시된 split을 제외한 나머지를 해당 split에 배정한다.
+- 둘 다 양수이면 정확히 지정한 수만 사용하며 남은 조합은 materialize하지 않는다.
+- 세 split은 모두 적어도 한 example을 포함해야 한다.
 
-두 방식 모두 같은 Transformer parameter와 causal-LM loss를 사용한다.
+큰 조합 공간에서 나머지 전체를 자동 배정하면 안전 한도인
+`--max-materialized-examples`를 넘을 수 있다. 대규모 실험에서는 validation/test
+개수를 명시하는 것이 좋다.
 
-### Combined dataset
+Split 전략은 다음 두 가지다.
 
-```bash
---training-mode combined
-```
-
-Atomic example 전체와 ID sorting training example을 하나의 pool에 합친 뒤 seed로
-한 번만 섞어 고정한다. Pool의 실제 atomic 비율이 effective atomic fraction이다.
-기본 방식이다.
-
-### Controlled task mixture
-
-```bash
---training-mode controlled --atomic-fraction 0.25 --batch-size 256
-```
-
-각 batch의 25%를 atomic, 나머지를 sorting example로 구성한다. 두 dataset stream과
-batch 내 task 위치는 처음 한 번 고정되며 이후 cyclic하게 순회한다. 반올림 후 각
-task가 최소 한 행 포함되어야 하므로 controlled mode에서는 양수 batch size가
-필요하다.
-
-## Dataset integrity 검사
-
-학습 시작 전에 다음을 강제로 검사하며 하나라도 위반되면 `ValueError`를 발생시킨다.
-
-1. ID/OOD intersection이 비어 있고 모든 entity가 정확히 한 group에 속함
-2. 모든 entity, 특히 모든 OOD entity의 올바른 atomic fact가 training에 존재함
-3. Sorting train과 ID validation에는 ID entity만 존재함
-4. OOD sorting test에는 OOD entity만 존재함
-5. Sorting train과 ID validation combination이 겹치지 않음
-6. 각 split 내부 combination이 중복되지 않음
-7. 한 sorting tuple의 KB value가 모두 다름
-8. Target entity가 input entity의 정확한 permutation임
-9. Target이 실제 KB value 오름차순임
-10. Serialized sorting input에 value token이 없음
-
-Run 시작 시 동일한 조건을 사람이 확인할 수 있도록 dataset summary와 atomic OOD,
-ID sorting train, OOD sorting test example도 출력한다. Preview 수는 `--preview`로
-조절하며 `0`이면 example 출력을 생략한다.
-
-## Evaluation과 CSV
-
-모든 exact accuracy는 teacher forcing 없는 greedy autoregressive generation으로
-계산한다. Atomic은 `[BOS ATOM ATTR entity SEP]` 뒤에 `value, EOS`를 생성하고,
-sorting은 `[BOS SORT ATTR entities... SEP]` 뒤에 `k`개 entity와 EOS를 생성한다.
-
-매 평가 시 다음을 별도로 측정한다.
-
-- Atomic 전체/ID/OOD loss, teacher-forced token accuracy, free-running exact
-- ID sorting train loss/token/exact
-- Unseen ID-combination validation sorting loss/token/exact
-- OOD-only test sorting loss/token/exact
-- Invalid token, early EOS, duplicate entity, input에 없는 entity 생성 비율
-
-호환용 기본 열은 sorting curve를 다음처럼 나타낸다.
-
-| 호환 열 | 의미 |
+| 값 | 동작 |
 | --- | --- |
-| `train_exact_acc` | ID sorting train exact |
-| `validation_exact_acc` | unseen ID-combination sorting exact |
-| `test_exact_acc` | OOD sorting exact |
-| `train_loss` | mixture 비율로 가중한 total training loss |
+| `random` | `--data-seed`로 조합 rank를 비복원 무작위 추출하고 세 split으로 나눈다. |
+| `lexicographic` | 조합 rank 앞부분부터 train, validation, test 순으로 나눈다. 분포 이동 기준선으로 사용할 수 있다. |
 
-`atomic_ood_exact_acc`가 충분히 높지 않으면 낮은 OOD sorting 성능을 composition
-실패로 단정하면 안 된다. 핵심 grokking 패턴은 atomic OOD와 sorting train exact가
-먼저 1에 가까워지고 OOD sorting exact가 뒤늦게 상승하는 것이다.
+Train/validation/test split의 행 순서와 각 행 내부의 입력 숫자 순서는 dataset 생성
+시점에 seed로 한 번만 결정된다. 학습이 시작된 뒤에는 어느 split도 다시 섞거나
+새 permutation을 만들지 않는다. Target은 항상 오름차순이다.
 
-`--n-eval`은 세 sorting split의 평가 example 수를 제한한다. Atomic ID/OOD는
-knowledge가 실제로 학습됐는지 확인하기 위해 항상 전체 entity를 평가한다.
+## 모델 설정
 
-## 그래프
+모델은 learned token embedding과 absolute positional embedding을 더한 뒤, 동일한
+causal mask를 사용하는 GPT block을 통과한다. 각 block은 pre-LayerNorm,
+multi-head self-attention, GELU MLP, residual connection으로 구성된다.
 
-`plot_grokking.py`가 entity-KB CSV를 자동 감지한다.
+주요 옵션은 다음과 같다.
 
-```bash
-python plot_grokking.py runs/entity_kb/metrics.csv \
-  --out runs/entity_kb/grokking.png \
-  --title "Entity-KB OOD sorting"
+| 옵션 | 의미 |
+| --- | --- |
+| `--n-layer` | GPT block 수 |
+| `--n-embd` | hidden/embedding 차원 |
+| `--n-head` | attention head 수; `n-embd`를 나누어야 함 |
+| `--dropout` | embedding, attention, MLP dropout |
+| `--no-bias` | attention과 MLP의 linear bias 제거 |
+| `--tie` | token embedding과 LM head weight 공유 |
+| `--init-std` | linear/embedding 정규분포 초기화 표준편차 |
+| `--layer-norm-epsilon` | LayerNorm epsilon |
+
+`--output-constraint`는 외형적 CLI 호환성을 위해 존재하지만 `free`만 허용한다.
+따라서 모델은 입력에 있는 숫자나 아직 생성하지 않은 숫자로 출력 후보를 제한받지
+않는다. 학습 초기에 숫자 대신 BOS나 SEP를 생성할 수 있으며, 이를 피하는 법도
+training data에서 학습해야 한다.
+
+## Optimizer와 batch
+
+`--optimizer`는 `adamw`, `adam`, `sgd`를 지원한다.
+
+| 옵션 | 적용 대상 |
+| --- | --- |
+| `--lr`, `--weight-decay` | 모든 optimizer |
+| `--beta1`, `--beta2` | AdamW와 Adam |
+| `--momentum` | SGD |
+| `--grad-clip` | gradient norm clipping; `0`이면 비활성화 |
+| `--warmup` | learning-rate warmup step |
+| `--lr-schedule` | `constant`, `cosine`, `linear` |
+| `--label-smoothing` | output 영역의 causal LM loss |
+
+양수 `--batch-size B`는 train split의 고정된 행 순서를 바꾸지 않고 연속한 `B`개씩
+순환한다. 마지막 행을 지나면 첫 행부터 이어지며 random shuffle이나 복원추출은
+하지 않는다. `--batch-size -1`은 매 step에서 고정된 train split 전체를 같은
+순서로 사용하는 full-batch다.
+CSV의 `epoch`은 누적 처리 example 수를 train split 크기로 나눈 값이다.
+
+## 평가 지표와 CSV
+
+평가는 step 1, `--eval-every` 간격, 마지막 step에 수행한다.
+`--n-eval -1`은 각 split 전체를 평가하고, 양수 값은 split 앞부분에서 해당 개수만
+평가한다. `--eval-batch`는 평가 chunk 크기다.
+
+각 지표의 정의는 다음과 같다.
+
+| 지표 | 정의 |
+| --- | --- |
+| `*_loss` | teacher forcing으로 정답 `k`개와 EOS에 계산한 평균 cross-entropy |
+| `*_token_acc` | 같은 output 영역의 teacher-forced next-token accuracy |
+| `*_exact_acc` | 자유 생성한 `sorted_1 ... sorted_k EOS` 전체가 일치한 example 비율 |
+
+Grokking 판단에는 teacher-forced token accuracy보다 오류 누적을 포함하는
+`train_exact_acc`, `validation_exact_acc`, `test_exact_acc`를 우선 확인한다.
+일반적으로 train exact가 먼저 상승한 뒤 validation/test exact가 늦게 상승하는지를
+장기간 추적한다.
+
+CSV에는 다음 열이 기록된다.
+
+```text
+step,epoch,lr,weight_norm,
+train_loss,train_token_acc,train_exact_acc,
+validation_loss,validation_token_acc,validation_exact_acc,
+test_loss,test_token_acc,test_exact_acc,
+elapsed_seconds,train_eval_count,validation_eval_count,test_eval_count,
+run_signature_sha256
 ```
 
-Entity-KB 그래프에는 다음 panel이 포함된다.
+## Grokking 그래프
 
-1. Sorting train / ID validation / OOD test exact
-2. 같은 세 split의 teacher-forced token accuracy
-3. Atomic ID / Atomic OOD free-running exact
-4. Total / atomic / sorting training loss 분해
-5. Sorting validation/test loss
-6. Parameter L2 norm
-
-여러 seed는 glob으로 함께 비교할 수 있고 기존 모델 CSV와 섞어서 전달할 수도 있다.
+`plot_grokking.py`가 CSV schema를 자동 감지하므로 기존 모델과 같은 명령으로
+그래프를 만들 수 있다.
 
 ```bash
-python plot_grokking.py "runs/entity_kb_seed*/metrics.csv" \
-  --out runs/entity_kb_comparison.png
+python plot_grokking.py runs/gpt_eos/metrics.csv \
+  --out runs/gpt_eos/grokking.png \
+  --title "GPT-2 sorting with EOS"
 ```
 
-기본 x축은 log scale이며 `--linear-x`로 선형 축을 사용한다.
+EOS 모델의 그래프는 다음 네 panel로 구성된다.
 
-## Checkpoint와 resume
+1. Train/validation/test autoregressive exact accuracy
+2. Train/validation/test teacher-forced token accuracy
+3. Train/validation/test loss
+4. Parameter L2 norm
 
-`--out-dir`에는 `config.json`, 주기 checkpoint와 `ckpt_final.pt`가 저장된다.
-Checkpoint에는 model/optimizer/scaler, 난수 상태, dataset/model config와 dataset
-fingerprint가 포함된다.
+터미널 요약에는 train exact 0.99, validation/test exact 0.90과 0.99에 최초로
+도달한 step, 최종 accuracy와 grokking gap이 표시된다. `gap x`는 기존 정의와
+같이 `test exact >= 0.90` 최초 step을 `train exact >= 0.99` 최초 step으로 나눈
+값이다.
+
+여러 seed 또는 설정은 glob으로 함께 그릴 수 있다.
+
+```bash
+python plot_grokking.py "runs/gpt_eos_seed*/metrics.csv" \
+  --out runs/gpt_eos_comparison.png
+```
+
+기존 모델 CSV와 EOS 모델 CSV를 같은 glob에 넣는 것도 지원한다. 이 경우 exact,
+loss와 norm은 공통 panel에 겹쳐 그리고, EOS token accuracy와 기존 모델의 생성
+분해 및 strata panel을 함께 추가한다. 기본 x축은 log scale이고 `--linear-x`로
+선형 축을 사용할 수 있다.
+
+## GPU 실행
+
+`--device auto`는 CUDA, MPS, CPU 순으로 사용 가능한 장치를 선택한다. CUDA에서는
+기본 예시처럼 bf16을 사용할 수 있다. GPU가 bf16을 지원하지 않으면
+`--dtype float16`을 사용한다.
 
 ```bash
 python sortformer_gpt_eos.py \
-  --n-entities 1000 --id-fraction 0.9 --value-min 0 --value-max 100 \
-  --k 3 --phi 3.6 --validation-count 2000 --test-count 5000 \
-  --training-mode combined --batch-size 256 \
-  --n-layer 8 --n-embd 512 --n-head 16 \
-  --optimizer adamw --lr 1e-3 --weight-decay 1.0 \
-  --steps 200000 \
-  --resume runs/entity_kb/ckpt_00100000.pt \
-  --log-csv runs/entity_kb/metrics.csv \
-  --out-dir runs/entity_kb
+  --n 50 --k 5 \
+  --train-count 128 --validation-count 10000 --test-count 20000 \
+  --n-layer 4 --n-embd 256 --n-head 8 \
+  --device auto --dtype bfloat16 --compile \
+  --batch-size 8192 --eval-batch 4096 \
+  --steps 500000 --eval-every 500 \
+  --log-csv runs/gpt_eos_gpu.csv \
+  --out-dir runs/gpt_eos_gpu --ckpt-every 10000
 ```
 
-`--steps`는 추가량이 아니라 최종 step이다. Dataset/model config, fingerprint,
-optimizer와 LR schedule, precision, training mode, mixture, dynamic permutation,
-batch size 또는 seed가 달라지면 재개를 거부한다.
+메모리가 부족하면 `--batch-size`, 그다음 `--eval-batch`를 줄인다. `--compile`은
+CUDA에서만 적용되며 첫 호출 때 compilation 시간이 든다.
 
-## GPU 실행 참고
+## Checkpoint 저장과 재개
 
-`--device auto`는 CUDA, MPS, CPU 순으로 선택한다. CUDA에서 bf16을 지원하지 않으면
-`--dtype float16`을 사용한다. OOM이면 `--batch-size`, 그다음 `--eval-batch`와
-`--n-eval`을 줄인다. `--compile`은 CUDA에서만 적용된다.
+`--out-dir`을 지정하면 다음 파일이 만들어진다.
+
+```text
+out-dir/
+  config.json
+  ckpt_00010000.pt
+  ckpt_00020000.pt
+  ...
+  ckpt_final.pt
+```
+
+주기 checkpoint는 `--ckpt-every`가 양수일 때 저장한다. `ckpt_final.pt`는
+`--out-dir`을 지정한 모든 정상 종료 실행에서 저장된다. Checkpoint에는 model,
+optimizer, AMP scaler, 난수 상태, model/dataset config와 run signature가 포함된다.
+
+다음처럼 동일 설정으로 최종 step만 늘려 재개한다.
+
+```bash
+python sortformer_gpt_eos.py \
+  --n 30 --k 5 \
+  --train-count 500 --validation-count 1000 --test-count 1000 \
+  --data-seed 0 --seed 42 \
+  --n-layer 4 --n-embd 256 --n-head 8 \
+  --optimizer adamw --lr 1e-3 --weight-decay 1.0 \
+  --steps 750000 \
+  --resume runs/gpt_eos/ckpt_00500000.pt \
+  --log-csv runs/gpt_eos/metrics.csv \
+  --out-dir runs/gpt_eos
+```
+
+`--steps`는 추가 학습량이 아니라 도달할 최종 step이다. Model 또는 dataset config,
+split fingerprint, vocabulary, optimizer 종류, seed 또는 batch size가 다르면 재개를 거부한다.
+기존 CSV의 signature가 다르거나 마지막 행이 checkpoint보다 뒤에 있어도 trajectory
+혼합 방지를 위해 거부한다.
+
+## Python API 사용
+
+Vocabulary, split, serialization과 모델은 독립적으로 사용할 수 있다.
+
+```python
+import torch
+
+from sortformer_gpt_eos import (
+    DatasetConfig,
+    GPTSortTransformer,
+    ModelConfig,
+    NumberVocabulary,
+    create_dataset_splits,
+    examples_to_tensors,
+    serialize_batch,
+)
+
+vocabulary = NumberVocabulary.contiguous(size=24, minimum=0)
+splits = create_dataset_splits(
+    DatasetConfig(
+        n=24,
+        set_size=3,
+        train_count=500,
+        validation_count=200,
+        test_count=200,
+        split_strategy="random",
+        seed=0,
+    )
+)
+
+inputs, targets = examples_to_tensors(splits.train)
+input_ids, labels = serialize_batch(inputs[:8], targets[:8], vocabulary)
+
+model = GPTSortTransformer(
+    ModelConfig(
+        vocab_size=vocabulary.number_token_count,
+        set_size=3,
+        n_embd=128,
+        n_head=4,
+        n_layer=2,
+    )
+)
+logits = model(input_ids)
+generated = model.generate(inputs[:8])
+```
+
+`generated`의 shape은 `[batch, k + 1]`이며 마지막 기대 token은 EOS다.

@@ -1,7 +1,7 @@
 # Causal GPT 정렬 모델 사용법
 
-> 이 문서는 기존 `sortformer_gpt.py`용이다. Atomic entity-value knowledge와
-> ID→OOD sorting composition을 단일 GPT로 학습하는 모델은
+> 이 문서는 기존 `sortformer_gpt.py`용이다. `BOS/input/SEP/output/EOS`
+> 단일 sequence, output-only label masking과 train/validation/test 3분할 모델은
 > [`GPT_EOS_USAGE_KO.md`](GPT_EOS_USAGE_KO.md)를 참고한다.
 
 `sortformer_gpt.py`는 encoder와 cross-attention 없이 하나의 GPT stack만 사용하는
