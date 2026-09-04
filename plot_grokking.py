@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot grokking training logs and summarize accuracy milestones."""
+"""Plot legacy and EOS-model grokking logs and summarize milestones."""
 
 from __future__ import annotations
 
@@ -15,16 +15,21 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-REQUIRED_COLUMNS = (
+CORE_COLUMNS = (
     "step",
     "weight_norm",
     "train_loss",
     "train_exact_acc",
     "test_loss",
-    "test_gen_in_set_token_acc",
-    "test_set_acc",
     "test_exact_acc",
 )
+TOKEN_COLUMNS = ("train_token_acc", "test_token_acc")
+VALIDATION_COLUMNS = (
+    "validation_loss",
+    "validation_token_acc",
+    "validation_exact_acc",
+)
+GENERATION_COLUMNS = ("test_gen_in_set_token_acc", "test_set_acc")
 STRATA = ("direct", "transitive", "unresolved")
 STRATA_COLUMNS = tuple(
     column
@@ -41,11 +46,17 @@ class LogError(ValueError):
 class Run:
     path: Path
     label: str
+    schema: str
     step: list[float]
     weight_norm: list[float]
     train_loss: list[float]
+    train_token_acc: list[float]
     train_exact_acc: list[float]
+    validation_loss: list[float]
+    validation_token_acc: list[float]
+    validation_exact_acc: list[float]
     test_loss: list[float]
+    test_token_acc: list[float]
     test_gen_in_set_token_acc: list[float]
     test_set_acc: list[float]
     test_exact_acc: list[float]
@@ -60,10 +71,13 @@ class Run:
 @dataclass(frozen=True)
 class Score:
     train99: float | None
+    validation90: float | None
+    validation99: float | None
     test90: float | None
     test99: float | None
     gap_x: float | None
     final_train: float
+    final_validation: float | None
     final_test: float
     final_norm: float
 
@@ -104,27 +118,45 @@ def load_run(path: str | os.PathLike[str]) -> Run:
         fieldnames = [name.strip() if name is not None else "" for name in reader.fieldnames]
         if len(fieldnames) != len(set(fieldnames)):
             raise LogError(f"{log_path}: CSV header contains duplicate columns")
-        missing = [
-            name for name in REQUIRED_COLUMNS + STRATA_COLUMNS
-            if name not in fieldnames
-        ]
+        has_validation = any(name in fieldnames for name in VALIDATION_COLUMNS)
+        has_generation = any(name in fieldnames for name in GENERATION_COLUMNS)
+        has_strata = any(name in fieldnames for name in STRATA_COLUMNS)
+        if has_validation:
+            schema = "eos"
+            required = CORE_COLUMNS + TOKEN_COLUMNS + VALIDATION_COLUMNS
+        elif has_generation or has_strata:
+            schema = "legacy"
+            required = CORE_COLUMNS + TOKEN_COLUMNS + GENERATION_COLUMNS + STRATA_COLUMNS
+        else:
+            raise LogError(
+                f"{log_path}: unrecognized CSV schema; expected validation columns "
+                "or legacy generation/strata columns"
+            )
+        missing = [name for name in required if name not in fieldnames]
         if missing:
             raise LogError(f"{log_path}: missing required columns: {', '.join(missing)}")
         reader.fieldnames = fieldnames
 
-        values = {name: [] for name in REQUIRED_COLUMNS + STRATA_COLUMNS}
+        all_columns = (
+            CORE_COLUMNS
+            + TOKEN_COLUMNS
+            + VALIDATION_COLUMNS
+            + GENERATION_COLUMNS
+            + STRATA_COLUMNS
+        )
+        values = {name: [] for name in all_columns}
         run_kinds: list[tuple[str, str]] = []
         for row_number, row in enumerate(reader, start=2):
             if None in row:
                 raise LogError(f"{log_path}: row {row_number} has more fields than the header")
             if not any(value and value.strip() for value in row.values()):
                 continue
-            for column in REQUIRED_COLUMNS:
-                values[column].append(_number(row.get(column), log_path, row_number, column))
-            for column in STRATA_COLUMNS:
-                values[column].append(
-                    _optional_number(row.get(column), log_path, row_number, column)
-                )
+            for column in required:
+                parser = _optional_number if column in STRATA_COLUMNS else _number
+                values[column].append(parser(row.get(column), log_path, row_number, column))
+            for column in all_columns:
+                if column not in required:
+                    values[column].append(_optional_number(row.get(column), log_path, row_number, column))
             task = (row.get("task") or "").strip()
             constraint = (row.get("output_constraint") or "").strip()
             kind = (task, constraint)
@@ -146,7 +178,7 @@ def load_run(path: str | os.PathLike[str]) -> Run:
     task, constraint = run_kinds[0]
     kind_label = " / ".join(value for value in (task, constraint) if value)
     label = f"{log_path.stem} / {kind_label}" if kind_label else log_path.stem
-    return Run(path=log_path, label=label, **values)
+    return Run(path=log_path, label=label, schema=schema, **values)
 
 
 def _first_step(steps: Sequence[float], values: Sequence[float], threshold: float) -> float | None:
@@ -156,6 +188,16 @@ def _first_step(steps: Sequence[float], values: Sequence[float], threshold: floa
 
 def score_run(run: Run) -> Score:
     train99 = _first_step(run.step, run.train_exact_acc, 0.99)
+    validation90 = (
+        _first_step(run.step, run.validation_exact_acc, 0.90)
+        if run.schema == "eos"
+        else None
+    )
+    validation99 = (
+        _first_step(run.step, run.validation_exact_acc, 0.99)
+        if run.schema == "eos"
+        else None
+    )
     test90 = _first_step(run.step, run.test_exact_acc, 0.90)
     test99 = _first_step(run.step, run.test_exact_acc, 0.99)
     gap_x = (
@@ -166,10 +208,15 @@ def score_run(run: Run) -> Score:
     final_index = max(range(len(run.step)), key=run.step.__getitem__)
     return Score(
         train99=train99,
+        validation90=validation90,
+        validation99=validation99,
         test90=test90,
         test99=test99,
         gap_x=gap_x,
         final_train=run.train_exact_acc[final_index],
+        final_validation=(
+            run.validation_exact_acc[final_index] if run.schema == "eos" else None
+        ),
         final_test=run.test_exact_acc[final_index],
         final_norm=run.weight_norm[final_index],
     )
@@ -205,22 +252,39 @@ def _format_number(value: float | None) -> str:
 
 
 def print_summary(runs: Sequence[Run]) -> None:
-    headers = ("run", "train>=.99", "test>=.90", "test>=.99", "gap x", "final train", "final test", "final norm")
+    include_validation = any(run.schema == "eos" for run in runs)
+    headers = ["run", "train>=.99"]
+    if include_validation:
+        headers.extend(("val>=.90", "val>=.99"))
+    headers.extend(("test>=.90", "test>=.99", "gap x", "final train"))
+    if include_validation:
+        headers.append("final val")
+    headers.extend(("final test", "final norm"))
     rows = []
     for run in runs:
         score = score_run(run)
-        rows.append(
+        row = [run.label, _format_number(score.train99)]
+        if include_validation:
+            row.extend(
+                (
+                    _format_number(score.validation90),
+                    _format_number(score.validation99),
+                )
+            )
+        row.extend(
             (
-                run.label,
-                _format_number(score.train99),
                 _format_number(score.test90),
                 _format_number(score.test99),
                 _format_number(score.gap_x),
                 _format_number(score.final_train),
-                _format_number(score.final_test),
-                _format_number(score.final_norm),
             )
         )
+        if include_validation:
+            row.append(_format_number(score.final_validation))
+        row.extend(
+            (_format_number(score.final_test), _format_number(score.final_norm))
+        )
+        rows.append(row)
     widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * width for width in widths))
@@ -242,7 +306,18 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
                 f"(no positive step: {', '.join(invalid)})"
             )
 
-    fig, axes = plt.subplots(1, 5, figsize=(23, 4.8), sharex=True)
+    has_eos = any(run.schema == "eos" for run in runs)
+    has_legacy = any(run.schema == "legacy" for run in runs)
+    panel_names = ["exact"]
+    if has_eos:
+        panel_names.append("token")
+    if has_legacy:
+        panel_names.extend(("generation", "strata"))
+    panel_names.extend(("loss", "norm"))
+    fig, axes = plt.subplots(
+        1, len(panel_names), figsize=(4.6 * len(panel_names), 4.8), sharex=True
+    )
+    axis = dict(zip(panel_names, axes))
     colors = plt.get_cmap("tab10")
     positive_losses = True
     for index, run in enumerate(runs):
@@ -251,60 +326,134 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
         x = [run.step[i] for i in points]
         train_exact = [run.train_exact_acc[i] for i in points]
         test_exact = [run.test_exact_acc[i] for i in points]
-        test_in_set = [run.test_gen_in_set_token_acc[i] for i in points]
-        test_set = [run.test_set_acc[i] for i in points]
         train_loss = [run.train_loss[i] for i in points]
         test_loss = [run.test_loss[i] for i in points]
         norm = [run.weight_norm[i] for i in points]
-        positive_losses = positive_losses and all(value > 0 for value in train_loss + test_loss)
+        losses = train_loss + test_loss
+        axis["loss"].plot(
+            x, train_loss, "--", color=color, label=f"{run.label} train"
+        )
 
-        axes[0].plot(x, train_exact, "--", color=color, label=f"{run.label} train")
-        axes[0].plot(x, test_exact, "-", color=color, label=f"{run.label} test")
-        axes[1].plot(x, test_in_set, ":", color=color, label=f"{run.label} in-set token")
-        axes[1].plot(x, test_set, "--", color=color, label=f"{run.label} set")
-        axes[1].plot(x, test_exact, "-", color=color, label=f"{run.label} exact")
-        styles = {"direct": ":", "transitive": "-", "unresolved": "--"}
-        for name in STRATA:
-            accuracy = getattr(run, f"test_{name}_exact_acc")
-            counts = getattr(run, f"test_{name}_count")
-            stratum_points = [
-                i for i in points
-                if math.isfinite(accuracy[i]) and counts[i] > 0
-            ]
-            if stratum_points:
-                axes[2].plot(
-                    [run.step[i] for i in stratum_points],
-                    [accuracy[i] for i in stratum_points],
-                    styles[name], color=color, label=f"{run.label} {name}",
-                )
-        axes[3].plot(x, train_loss, "--", color=color, label=f"{run.label} train")
-        axes[3].plot(x, test_loss, "-", color=color, label=f"{run.label} test")
-        axes[4].plot(x, norm, color=color, label=run.label)
+        axis["exact"].plot(
+            x, train_exact, "--", color=color, label=f"{run.label} train"
+        )
+        if run.schema == "eos":
+            validation_exact = [run.validation_exact_acc[i] for i in points]
+            axis["exact"].plot(
+                x,
+                validation_exact,
+                "-.",
+                color=color,
+                label=f"{run.label} validation",
+            )
+        axis["exact"].plot(
+            x, test_exact, "-", color=color, label=f"{run.label} test"
+        )
 
-    axes[0].set_title("Exact accuracy")
-    axes[0].set_ylabel("Accuracy")
-    axes[0].set_ylim(-0.02, 1.02)
-    axes[1].set_title("Test generation decomposition")
-    axes[1].set_ylabel("Accuracy")
-    axes[1].set_ylim(-0.02, 1.02)
-    axes[2].set_title("Test strata exact")
-    axes[2].set_ylabel("Accuracy")
-    axes[2].set_ylim(-0.02, 1.02)
-    axes[3].set_title("Loss")
-    axes[3].set_ylabel("Loss")
-    axes[4].set_title("Parameter L2 norm")
-    axes[4].set_ylabel("L2 norm")
+        if run.schema == "eos":
+            axis["token"].plot(
+                x,
+                [run.train_token_acc[i] for i in points],
+                "--",
+                color=color,
+                label=f"{run.label} train",
+            )
+            axis["token"].plot(
+                x,
+                [run.validation_token_acc[i] for i in points],
+                "-.",
+                color=color,
+                label=f"{run.label} validation",
+            )
+            axis["token"].plot(
+                x,
+                [run.test_token_acc[i] for i in points],
+                "-",
+                color=color,
+                label=f"{run.label} test",
+            )
+            validation_loss = [run.validation_loss[i] for i in points]
+            losses.extend(validation_loss)
+            axis["loss"].plot(
+                x,
+                validation_loss,
+                "-.",
+                color=color,
+                label=f"{run.label} validation",
+            )
+
+        if run.schema == "legacy":
+            axis["generation"].plot(
+                x,
+                [run.test_gen_in_set_token_acc[i] for i in points],
+                ":",
+                color=color,
+                label=f"{run.label} in-set token",
+            )
+            axis["generation"].plot(
+                x,
+                [run.test_set_acc[i] for i in points],
+                "--",
+                color=color,
+                label=f"{run.label} set",
+            )
+            axis["generation"].plot(
+                x, test_exact, "-", color=color, label=f"{run.label} exact"
+            )
+            styles = {"direct": ":", "transitive": "-", "unresolved": "--"}
+            for name in STRATA:
+                accuracy = getattr(run, f"test_{name}_exact_acc")
+                counts = getattr(run, f"test_{name}_count")
+                stratum_points = [
+                    i
+                    for i in points
+                    if math.isfinite(accuracy[i]) and counts[i] > 0
+                ]
+                if stratum_points:
+                    axis["strata"].plot(
+                        [run.step[i] for i in stratum_points],
+                        [accuracy[i] for i in stratum_points],
+                        styles[name],
+                        color=color,
+                        label=f"{run.label} {name}",
+                    )
+
+        positive_losses = positive_losses and all(value > 0 for value in losses)
+        axis["loss"].plot(
+            x, test_loss, "-", color=color, label=f"{run.label} test"
+        )
+        axis["norm"].plot(x, norm, color=color, label=run.label)
+
+    axis["exact"].set_title("Exact accuracy")
+    axis["exact"].set_ylabel("Accuracy")
+    axis["exact"].set_ylim(-0.02, 1.02)
+    if has_eos:
+        axis["token"].set_title("Teacher-forced token accuracy")
+        axis["token"].set_ylabel("Accuracy")
+        axis["token"].set_ylim(-0.02, 1.02)
+    if has_legacy:
+        axis["generation"].set_title("Test generation decomposition")
+        axis["generation"].set_ylabel("Accuracy")
+        axis["generation"].set_ylim(-0.02, 1.02)
+        axis["strata"].set_title("Test strata exact")
+        axis["strata"].set_ylabel("Accuracy")
+        axis["strata"].set_ylim(-0.02, 1.02)
+    axis["loss"].set_title("Loss")
+    axis["loss"].set_ylabel("Loss")
+    axis["norm"].set_title("Parameter L2 norm")
+    axis["norm"].set_ylabel("L2 norm")
     if positive_losses:
-        axes[3].set_yscale("log")
+        axis["loss"].set_yscale("log")
     else:
         print("warning: nonpositive loss found; using a linear loss axis", file=sys.stderr)
 
-    for axis in axes:
+    for current_axis in axes:
         if not linear_x:
-            axis.set_xscale("log")
-        axis.set_xlabel("Step")
-        axis.grid(True, which="both", alpha=0.25)
-        axis.legend(fontsize="small")
+            current_axis.set_xscale("log")
+        current_axis.set_xlabel("Step")
+        current_axis.grid(True, which="both", alpha=0.25)
+        if current_axis.lines:
+            current_axis.legend(fontsize="small")
     if title:
         fig.suptitle(title)
     fig.tight_layout()
@@ -340,6 +489,7 @@ def selftest() -> None:
             writer.writerows(rows)
         run = load_run(path)
         score = score_run(run)
+        assert run.schema == "legacy"
         assert run.label == "sample / sort / free"
         assert score.train99 == 10
         assert score.test90 == 20
@@ -348,6 +498,34 @@ def selftest() -> None:
         assert score.final_train == 1
         assert score.final_test == .995
         assert score.final_norm == 2.7
+        eos_columns = [
+            "step", "epoch", "lr", "weight_norm",
+            "train_loss", "train_token_acc", "train_exact_acc",
+            "validation_loss", "validation_token_acc", "validation_exact_acc",
+            "test_loss", "test_token_acc", "test_exact_acc",
+            "elapsed_seconds", "train_eval_count", "validation_eval_count",
+            "test_eval_count", "run_signature_sha256",
+        ]
+        eos_rows = [
+            [1, .1, .001, 2.0, 1.0, .5, .5, 1.1, .4, 0, 1.2, .3, 0, 0, 10, 10, 10, "a"],
+            [20, 2, .001, 2.7, .01, 1, 1, .02, 1, 1, .03, .95, .92, 2, 10, 10, 10, "a"],
+            [10, 1, .001, 2.4, .1, 1, 1, .2, .95, .91, .3, .8, .5, 1, 10, 10, 10, "a"],
+        ]
+        eos_path = Path(directory) / "eos.csv"
+        with eos_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(eos_columns)
+            writer.writerows(eos_rows)
+        eos_run = load_run(eos_path)
+        eos_score = score_run(eos_run)
+        assert eos_run.schema == "eos"
+        assert eos_run.step == [1, 10, 20]
+        assert eos_score.train99 == 10
+        assert eos_score.validation90 == 10
+        assert eos_score.validation99 == 20
+        assert eos_score.test90 == 20
+        assert eos_score.gap_x == 2
+        assert eos_score.final_validation == 1
     print("selftest passed")
 
 

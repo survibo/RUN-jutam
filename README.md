@@ -28,7 +28,7 @@
 | [`sortformer_gpt.py`](sortformer_gpt.py) | 단일 causal self-attention stack 기반 GPT 정렬 모델 |
 | [`sortformer_gpt_eos.py`](sortformer_gpt_eos.py) | BOS/SEP/EOS와 output-only label masking을 사용하는 GPT-2식 3-way split 모델 |
 | [`sweep.py`](sweep.py)                 | train count, split 전략, seed와 하이퍼파라미터 sweep |
-| [`plot_grokking.py`](plot_grokking.py) | CSV의 다섯 panel 시각화와 grokking gap 계산          |
+| [`plot_grokking.py`](plot_grokking.py) | 기존/EOS CSV 자동 감지 시각화와 grokking gap 계산    |
 | [`microgpt_org.py`](microgpt_org.py)   | 원본 microGPT 참고 코드                              |
 | [`USAGE_KO.md`](USAGE_KO.md)           | 설치, 실행 옵션과 운영 절차                          |
 | [`PRINCIPLES_KO.md`](PRINCIPLES_KO.md) | 실험 설계 원리와 결과 해석                           |

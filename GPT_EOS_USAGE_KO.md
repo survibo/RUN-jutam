@@ -218,9 +218,40 @@ elapsed_seconds,train_eval_count,validation_eval_count,test_eval_count,
 run_signature_sha256
 ```
 
-기존 `plot_grokking.py`는 set/strata 열을 요구하는 기존 모델 전용이므로 이 CSV를
-직접 읽지 못한다. 새 모델의 CSV는 pandas, spreadsheet 또는 별도 plotting 코드로
-`step` 대비 세 split의 `exact_acc`와 `loss`를 그리면 된다.
+## Grokking 그래프
+
+`plot_grokking.py`가 CSV schema를 자동 감지하므로 기존 모델과 같은 명령으로
+그래프를 만들 수 있다.
+
+```bash
+python plot_grokking.py runs/gpt_eos/metrics.csv \
+  --out runs/gpt_eos/grokking.png \
+  --title "GPT-2 sorting with EOS"
+```
+
+EOS 모델의 그래프는 다음 네 panel로 구성된다.
+
+1. Train/validation/test autoregressive exact accuracy
+2. Train/validation/test teacher-forced token accuracy
+3. Train/validation/test loss
+4. Parameter L2 norm
+
+터미널 요약에는 train exact 0.99, validation/test exact 0.90과 0.99에 최초로
+도달한 step, 최종 accuracy와 grokking gap이 표시된다. `gap x`는 기존 정의와
+같이 `test exact >= 0.90` 최초 step을 `train exact >= 0.99` 최초 step으로 나눈
+값이다.
+
+여러 seed 또는 설정은 glob으로 함께 그릴 수 있다.
+
+```bash
+python plot_grokking.py "runs/gpt_eos_seed*/metrics.csv" \
+  --out runs/gpt_eos_comparison.png
+```
+
+기존 모델 CSV와 EOS 모델 CSV를 같은 glob에 넣는 것도 지원한다. 이 경우 exact,
+loss와 norm은 공통 panel에 겹쳐 그리고, EOS token accuracy와 기존 모델의 생성
+분해 및 strata panel을 함께 추가한다. 기본 x축은 log scale이고 `--linear-x`로
+선형 축을 사용할 수 있다.
 
 ## GPU 실행
 
@@ -327,4 +358,3 @@ generated = model.generate(inputs[:8])
 ```
 
 `generated`의 shape은 `[batch, k + 1]`이며 마지막 기대 token은 EOS다.
-
