@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot legacy and EOS-model grokking logs and summarize milestones."""
+"""Plot legacy, numeric-EOS, and entity-KB grokking logs."""
 
 from __future__ import annotations
 
@@ -29,6 +29,12 @@ VALIDATION_COLUMNS = (
     "validation_token_acc",
     "validation_exact_acc",
 )
+ENTITY_COLUMNS = (
+    "atomic_id_exact_acc",
+    "atomic_ood_exact_acc",
+    "atomic_train_loss",
+    "sorting_train_loss",
+)
 GENERATION_COLUMNS = ("test_gen_in_set_token_acc", "test_set_acc")
 STRATA = ("direct", "transitive", "unresolved")
 STRATA_COLUMNS = tuple(
@@ -55,6 +61,10 @@ class Run:
     validation_loss: list[float]
     validation_token_acc: list[float]
     validation_exact_acc: list[float]
+    atomic_id_exact_acc: list[float]
+    atomic_ood_exact_acc: list[float]
+    atomic_train_loss: list[float]
+    sorting_train_loss: list[float]
     test_loss: list[float]
     test_token_acc: list[float]
     test_gen_in_set_token_acc: list[float]
@@ -118,10 +128,14 @@ def load_run(path: str | os.PathLike[str]) -> Run:
         fieldnames = [name.strip() if name is not None else "" for name in reader.fieldnames]
         if len(fieldnames) != len(set(fieldnames)):
             raise LogError(f"{log_path}: CSV header contains duplicate columns")
+        has_entity = any(name in fieldnames for name in ENTITY_COLUMNS)
         has_validation = any(name in fieldnames for name in VALIDATION_COLUMNS)
         has_generation = any(name in fieldnames for name in GENERATION_COLUMNS)
         has_strata = any(name in fieldnames for name in STRATA_COLUMNS)
-        if has_validation:
+        if has_entity:
+            schema = "entity"
+            required = CORE_COLUMNS + TOKEN_COLUMNS + VALIDATION_COLUMNS + ENTITY_COLUMNS
+        elif has_validation:
             schema = "eos"
             required = CORE_COLUMNS + TOKEN_COLUMNS + VALIDATION_COLUMNS
         elif has_generation or has_strata:
@@ -141,6 +155,7 @@ def load_run(path: str | os.PathLike[str]) -> Run:
             CORE_COLUMNS
             + TOKEN_COLUMNS
             + VALIDATION_COLUMNS
+            + ENTITY_COLUMNS
             + GENERATION_COLUMNS
             + STRATA_COLUMNS
         )
@@ -190,12 +205,12 @@ def score_run(run: Run) -> Score:
     train99 = _first_step(run.step, run.train_exact_acc, 0.99)
     validation90 = (
         _first_step(run.step, run.validation_exact_acc, 0.90)
-        if run.schema == "eos"
+        if run.schema != "legacy"
         else None
     )
     validation99 = (
         _first_step(run.step, run.validation_exact_acc, 0.99)
-        if run.schema == "eos"
+        if run.schema != "legacy"
         else None
     )
     test90 = _first_step(run.step, run.test_exact_acc, 0.90)
@@ -215,7 +230,7 @@ def score_run(run: Run) -> Score:
         gap_x=gap_x,
         final_train=run.train_exact_acc[final_index],
         final_validation=(
-            run.validation_exact_acc[final_index] if run.schema == "eos" else None
+            run.validation_exact_acc[final_index] if run.schema != "legacy" else None
         ),
         final_test=run.test_exact_acc[final_index],
         final_norm=run.weight_norm[final_index],
@@ -252,7 +267,7 @@ def _format_number(value: float | None) -> str:
 
 
 def print_summary(runs: Sequence[Run]) -> None:
-    include_validation = any(run.schema == "eos" for run in runs)
+    include_validation = any(run.schema != "legacy" for run in runs)
     headers = ["run", "train>=.99"]
     if include_validation:
         headers.extend(("val>=.90", "val>=.99"))
@@ -306,11 +321,14 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
                 f"(no positive step: {', '.join(invalid)})"
             )
 
-    has_eos = any(run.schema == "eos" for run in runs)
+    has_modern = any(run.schema != "legacy" for run in runs)
+    has_entity = any(run.schema == "entity" for run in runs)
     has_legacy = any(run.schema == "legacy" for run in runs)
     panel_names = ["exact"]
-    if has_eos:
+    if has_modern:
         panel_names.append("token")
+    if has_entity:
+        panel_names.extend(("atomic", "components"))
     if has_legacy:
         panel_names.extend(("generation", "strata"))
     panel_names.extend(("loss", "norm"))
@@ -330,47 +348,51 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
         test_loss = [run.test_loss[i] for i in points]
         norm = [run.weight_norm[i] for i in points]
         losses = train_loss + test_loss
+        train_name = "sorting train" if run.schema == "entity" else "train"
+        validation_name = "ID validation" if run.schema == "entity" else "validation"
+        test_name = "OOD test" if run.schema == "entity" else "test"
+        loss_train_name = "total train" if run.schema == "entity" else "train"
         axis["loss"].plot(
-            x, train_loss, "--", color=color, label=f"{run.label} train"
+            x, train_loss, "--", color=color, label=f"{run.label} {loss_train_name}"
         )
 
         axis["exact"].plot(
-            x, train_exact, "--", color=color, label=f"{run.label} train"
+            x, train_exact, "--", color=color, label=f"{run.label} {train_name}"
         )
-        if run.schema == "eos":
+        if run.schema != "legacy":
             validation_exact = [run.validation_exact_acc[i] for i in points]
             axis["exact"].plot(
                 x,
                 validation_exact,
                 "-.",
                 color=color,
-                label=f"{run.label} validation",
+                label=f"{run.label} {validation_name}",
             )
         axis["exact"].plot(
-            x, test_exact, "-", color=color, label=f"{run.label} test"
+            x, test_exact, "-", color=color, label=f"{run.label} {test_name}"
         )
 
-        if run.schema == "eos":
+        if run.schema != "legacy":
             axis["token"].plot(
                 x,
                 [run.train_token_acc[i] for i in points],
                 "--",
                 color=color,
-                label=f"{run.label} train",
+                label=f"{run.label} {train_name}",
             )
             axis["token"].plot(
                 x,
                 [run.validation_token_acc[i] for i in points],
                 "-.",
                 color=color,
-                label=f"{run.label} validation",
+                label=f"{run.label} {validation_name}",
             )
             axis["token"].plot(
                 x,
                 [run.test_token_acc[i] for i in points],
                 "-",
                 color=color,
-                label=f"{run.label} test",
+                label=f"{run.label} {test_name}",
             )
             validation_loss = [run.validation_loss[i] for i in points]
             losses.extend(validation_loss)
@@ -379,7 +401,28 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
                 validation_loss,
                 "-.",
                 color=color,
-                label=f"{run.label} validation",
+                label=f"{run.label} {validation_name}",
+            )
+
+        if run.schema == "entity":
+            axis["atomic"].plot(
+                x, [run.atomic_id_exact_acc[i] for i in points], "--",
+                color=color, label=f"{run.label} atomic ID",
+            )
+            axis["atomic"].plot(
+                x, [run.atomic_ood_exact_acc[i] for i in points], "-",
+                color=color, label=f"{run.label} atomic OOD",
+            )
+            axis["components"].plot(
+                x, train_loss, ":", color=color, label=f"{run.label} total",
+            )
+            axis["components"].plot(
+                x, [run.atomic_train_loss[i] for i in points], "--",
+                color=color, label=f"{run.label} atomic",
+            )
+            axis["components"].plot(
+                x, [run.sorting_train_loss[i] for i in points], "-",
+                color=color, label=f"{run.label} sorting",
             )
 
         if run.schema == "legacy":
@@ -420,17 +463,24 @@ def plot_runs(runs: Sequence[Run], out: Path, title: str | None, linear_x: bool)
 
         positive_losses = positive_losses and all(value > 0 for value in losses)
         axis["loss"].plot(
-            x, test_loss, "-", color=color, label=f"{run.label} test"
+            x, test_loss, "-", color=color, label=f"{run.label} {test_name}"
         )
         axis["norm"].plot(x, norm, color=color, label=run.label)
 
     axis["exact"].set_title("Exact accuracy")
     axis["exact"].set_ylabel("Accuracy")
     axis["exact"].set_ylim(-0.02, 1.02)
-    if has_eos:
+    if has_modern:
         axis["token"].set_title("Teacher-forced token accuracy")
         axis["token"].set_ylabel("Accuracy")
         axis["token"].set_ylim(-0.02, 1.02)
+    if has_entity:
+        axis["atomic"].set_title("Atomic fact exact accuracy")
+        axis["atomic"].set_ylabel("Accuracy")
+        axis["atomic"].set_ylim(-0.02, 1.02)
+        axis["components"].set_title("Joint training loss components")
+        axis["components"].set_ylabel("Loss")
+        axis["components"].set_yscale("log")
     if has_legacy:
         axis["generation"].set_title("Test generation decomposition")
         axis["generation"].set_ylabel("Accuracy")
