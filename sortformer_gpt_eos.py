@@ -291,11 +291,16 @@ def serialize_batch(
     return input_ids, labels
 
 
-def shuffled_rows(
-    inputs: torch.Tensor, generator: torch.Generator | None = None
+def fixed_batch_indices(
+    length: int, batch_size: int, step: int, device: torch.device
 ) -> torch.Tensor:
-    order = torch.rand(inputs.shape, device=inputs.device, generator=generator).argsort(dim=1)
-    return inputs.gather(1, order)
+    """Traverse immutable dataset rows cyclically without shuffling or resampling."""
+    if length < 1 or step < 1 or batch_size == 0 or batch_size < -1:
+        raise ValueError("invalid fixed-batch index settings")
+    if batch_size == -1:
+        return torch.arange(length, device=device)
+    start = ((step - 1) * batch_size) % length
+    return torch.arange(start, start + batch_size, device=device) % length
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +753,9 @@ def train(args: argparse.Namespace) -> int:
         "number_vocabulary": list(vocabulary.numbers),
         "optimizer": args.optimizer,
         "seed": args.seed,
+        "input_order": "fixed-per-example-v1",
+        "batch_order": "fixed-cyclic-v1",
+        "batch_size": args.batch_size,
     }
     run_signature_sha256 = signature_digest(run_signature)
 
@@ -826,13 +834,11 @@ def train(args: argparse.Namespace) -> int:
         f"sequence=[BOS,{args.set_size} inputs,SEP,{args.set_size} targets,EOS] "
         f"supervised_tokens/example={args.set_size + 1}"
     )
-
-    full_batch_indices = (
-        torch.arange(len(train_x), device=train_x.device)
-        if args.batch_size == -1
-        else None
+    print(
+        f"data_order=fixed batch_order="
+        f"{'full-batch' if args.batch_size == -1 else 'fixed-cyclic'}"
     )
-    step_generator = torch.Generator(device=train_x.device)
+
     started = time.perf_counter()
     examples_seen = start_step * effective_batch_size
     for step in range(start_step + 1, args.steps + 1):
@@ -840,17 +846,10 @@ def train(args: argparse.Namespace) -> int:
         learning_rate = lr_for_step(args, step)
         for group in optimizer.param_groups:
             group["lr"] = learning_rate
-        step_generator.manual_seed(args.seed + step)
-        if full_batch_indices is None:
-            indices = torch.randint(
-                len(train_x),
-                (effective_batch_size,),
-                device=train_x.device,
-                generator=step_generator,
-            )
-        else:
-            indices = full_batch_indices
-        x = shuffled_rows(train_x[indices], step_generator)
+        indices = fixed_batch_indices(
+            len(train_x), args.batch_size, step, train_x.device
+        )
+        x = train_x[indices]
         y = train_y[indices]
         x = x.to(device, non_blocking=device.type == "cuda")
         y = y.to(device, non_blocking=device.type == "cuda")
@@ -1006,7 +1005,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=512,
-        help="positive: sample with replacement; -1: use every training row per step",
+        help="positive: traverse fixed rows cyclically; -1: use every training row per step",
     )
     parser.add_argument("--optimizer", choices=("adamw", "adam", "sgd"), default="adamw")
     parser.add_argument("--lr", "--learning-rate", dest="lr", type=float, default=1e-3)

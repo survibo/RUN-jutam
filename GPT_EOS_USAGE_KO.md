@@ -143,8 +143,9 @@ Split 전략은 다음 두 가지다.
 | `random` | `--data-seed`로 조합 rank를 비복원 무작위 추출하고 세 split으로 나눈다. |
 | `lexicographic` | 조합 rank 앞부분부터 train, validation, test 순으로 나눈다. 분포 이동 기준선으로 사용할 수 있다. |
 
-저장된 train 입력에도 재현 가능한 무작위 순서가 부여되며, 실제 학습 batch에서는
-입력 순서를 step마다 다시 섞는다. Target은 항상 오름차순이다.
+Train/validation/test split의 행 순서와 각 행 내부의 입력 숫자 순서는 dataset 생성
+시점에 seed로 한 번만 결정된다. 학습이 시작된 뒤에는 어느 split도 다시 섞거나
+새 permutation을 만들지 않는다. Target은 항상 오름차순이다.
 
 ## 모델 설정
 
@@ -184,8 +185,10 @@ training data에서 학습해야 한다.
 | `--lr-schedule` | `constant`, `cosine`, `linear` |
 | `--label-smoothing` | output 영역의 causal LM loss |
 
-양수 `--batch-size B`는 train split에서 매 step `B`개를 복원추출한다.
-`--batch-size -1`은 각 step에서 train example을 모두 한 번씩 사용하는 full-batch다.
+양수 `--batch-size B`는 train split의 고정된 행 순서를 바꾸지 않고 연속한 `B`개씩
+순환한다. 마지막 행을 지나면 첫 행부터 이어지며 random shuffle이나 복원추출은
+하지 않는다. `--batch-size -1`은 매 step에서 고정된 train split 전체를 같은
+순서로 사용하는 full-batch다.
 CSV의 `epoch`은 누적 처리 example 수를 train split 크기로 나눈 값이다.
 
 ## 평가 지표와 CSV
@@ -307,7 +310,7 @@ python sortformer_gpt_eos.py \
 ```
 
 `--steps`는 추가 학습량이 아니라 도달할 최종 step이다. Model 또는 dataset config,
-split fingerprint, vocabulary, optimizer 종류와 seed가 다르면 재개를 거부한다.
+split fingerprint, vocabulary, optimizer 종류, seed 또는 batch size가 다르면 재개를 거부한다.
 기존 CSV의 signature가 다르거나 마지막 행이 checkpoint보다 뒤에 있어도 trajectory
 혼합 방지를 위해 거부한다.
 
