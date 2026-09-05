@@ -782,7 +782,12 @@ def train(args: argparse.Namespace) -> int:
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
         if device.type == "cuda" and checkpoint.get("cuda_rng_state") is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+            # ``map_location=device`` also moves these saved CPU ByteTensors to
+            # CUDA, but PyTorch's RNG restore API requires CPU ByteTensors.
+            cuda_rng_state = [
+                state.cpu() for state in checkpoint["cuda_rng_state"]
+            ]
+            torch.cuda.set_rng_state_all(cuda_rng_state)
 
     executable: nn.Module = model
     if args.compile and device.type == "cuda":
